@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -2904,7 +2905,6 @@ static void capture_ir_command_action(char *out, size_t outlen) {
 static void page_head(FILE *f, const char *title) {
     int cloud_blocked = load_cloud_blocker();
     fprintf(f,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
         "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>");
     html(f, title);
@@ -4406,7 +4406,13 @@ static void system_panel(FILE *f) {
 static void render_page(int fd, const char *message) {
     struct mqtt_config mqtt;
     struct wifi_config wifi;
-    FILE *f = fdopen(dup(fd), "w");
+    char *body = NULL;
+    size_t body_len = 0;
+    char hdr[200];
+    /* Buffer the page so we can send a Content-Length. If a render is ever cut
+     * short (e.g. an out-of-memory kill), no headers are emitted and the client
+     * sees a reset/short read instead of silently rendering a half page. */
+    FILE *f = open_memstream(&body, &body_len);
     if (!f) return;
     load_mqtt(&mqtt);
     load_wifi(&wifi);
@@ -4430,7 +4436,14 @@ static void render_page(int fd, const char *message) {
     backup_panel(f);
     system_panel(f);
     page_end(f);
-    fclose(f);
+    if (fclose(f) != 0 || !body) { free(body); return; }
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+        "Cache-Control: no-store\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
+        (unsigned long)body_len);
+    send_all(fd, hdr, strlen(hdr));
+    send_all(fd, body, body_len);
+    free(body);
 }
 
 static void handle_mqtt(int fd, const struct request *req) {
