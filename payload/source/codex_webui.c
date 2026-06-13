@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -133,7 +134,8 @@ struct ir_device {
     int control_port;
     int transport;
     int command_count;
-    struct ir_command commands[MAX_IR_COMMANDS];
+    int command_cap;
+    struct ir_command *commands;
 };
 
 struct ir_inventory {
@@ -1368,10 +1370,21 @@ static int load_ir_inventory(struct ir_inventory *inv) {
         if (cmd_arr && cmd_end) {
             cpos = cmd_arr + 1;
             while ((cpos = strchr(cpos, '{')) != NULL && cpos < cmd_end && dev->command_count < MAX_IR_COMMANDS) {
-                struct ir_command *cmd = &dev->commands[dev->command_count];
+                struct ir_command *cmd;
                 const char *obj_end = find_matching_json(cpos, '{', '}');
                 long cid;
                 if (!obj_end || obj_end > cmd_end) break;
+                if (dev->command_count >= dev->command_cap) {
+                    int ncap = dev->command_cap ? dev->command_cap * 2 : 8;
+                    struct ir_command *grown;
+                    if (ncap > MAX_IR_COMMANDS) ncap = MAX_IR_COMMANDS;
+                    grown = (struct ir_command *)realloc(dev->commands, (size_t)ncap * sizeof(*grown));
+                    if (!grown) break;
+                    dev->commands = grown;
+                    dev->command_cap = ncap;
+                }
+                cmd = &dev->commands[dev->command_count];
+                memset(cmd, 0, sizeof(*cmd));
                 cid = json_long_range(cpos, obj_end, "Id-", 0);
                 snprintf(cmd->id, sizeof(cmd->id), "%ld", cid);
                 if (cid > inv->max_command_id) inv->max_command_id = cid;
@@ -1392,18 +1405,41 @@ static int load_ir_inventory(struct ir_inventory *inv) {
     return 0;
 }
 
+/* Release the per-device command arrays allocated by load_ir_inventory.
+ * Safe to call on a zero-initialized or partially loaded inventory. */
+static void free_ir_inventory(struct ir_inventory *inv) {
+    int i;
+    if (!inv) return;
+    for (i = 0; i < inv->device_count; i++) {
+        free(inv->devices[i].commands);
+        inv->devices[i].commands = NULL;
+        inv->devices[i].command_cap = 0;
+        inv->devices[i].command_count = 0;
+    }
+    inv->device_count = 0;
+}
+
+/* Free a heap-allocated inventory together with its command arrays. */
+static void destroy_ir_inventory(struct ir_inventory *inv) {
+    if (!inv) return;
+    free_ir_inventory(inv);
+    free(inv);
+}
+
 static int find_ir_device_by_name(const char *name, char *device_id, size_t device_id_len) {
     struct ir_inventory inv;
-    int i;
+    int i, rc = -1;
     if (!name || !name[0] || !device_id || !device_id_len) return -1;
     if (load_ir_inventory(&inv) != 0) return -1;
     for (i = 0; i < inv.device_count; i++) {
         if (strcasecmp(inv.devices[i].name, name) == 0) {
             snprintf(device_id, device_id_len, "%s", inv.devices[i].id);
-            return 0;
+            rc = 0;
+            break;
         }
     }
-    return -1;
+    free_ir_inventory(&inv);
+    return rc;
 }
 
 static void capture_ir_command_action(char *out, size_t outlen);
@@ -2869,7 +2905,6 @@ static void capture_ir_command_action(char *out, size_t outlen) {
 static void page_head(FILE *f, const char *title) {
     int cloud_blocked = load_cloud_blocker();
     fprintf(f,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
         "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>");
     html(f, title);
@@ -3717,7 +3752,7 @@ static void ir_control_panel(FILE *f) {
         fprintf(f, "<div class='panel'><pre>Unable to read ");
         html(f, DEVICE_LIST);
         fprintf(f, "</pre></div></section>");
-        free(inv);
+        destroy_ir_inventory(inv);
         return;
     }
     if (inv->device_count > 0) {
@@ -3744,7 +3779,7 @@ static void ir_control_panel(FILE *f) {
         fprintf(f, "<div class='panel'><h3>No stored remotes yet</h3><div class='muted'>Create a device in IR Setup, search a code database, or learn commands from an existing remote.</div><div class='actions'><button type='button' data-view-target='ir'>Open IR Setup</button></div></div>");
     }
     fprintf(f, "</section>");
-    free(inv);
+    destroy_ir_inventory(inv);
 }
 
 static void ir_panel(FILE *f) {
@@ -3756,7 +3791,7 @@ static void ir_panel(FILE *f) {
         fprintf(f, "<div class='panel'><pre>Unable to read ");
         html(f, DEVICE_LIST);
         fprintf(f, "</pre></div></section>");
-        free(inv);
+        destroy_ir_inventory(inv);
         return;
     }
     ir_setup_flow(f, inv);
@@ -3784,7 +3819,7 @@ static void ir_panel(FILE *f) {
         fprintf(f, "<div class='panel'><h3>No stored remotes yet</h3><div class='muted'>Create a device above, search a code database, or learn commands from an existing remote.</div></div>");
     }
     fprintf(f, "</section>");
-    free(inv);
+    destroy_ir_inventory(inv);
 }
 
 static void ir_lab_panel(FILE *f) {
@@ -3795,7 +3830,7 @@ static void ir_lab_panel(FILE *f) {
         fprintf(f, "<div class='panel'><pre>Unable to read ");
         html(f, DEVICE_LIST);
         fprintf(f, "</pre></div></section>");
-        free(inv);
+        destroy_ir_inventory(inv);
         return;
     }
     fprintf(f, "<div class='lab-layout'><div class='panel'><h3>Find command files</h3><div class='callout'><strong>Search first, send second.</strong>Start with a device, brand, model, or database path. Search shows matching files; Load commands reads those files and adds usable, non-duplicate commands to the queue.</div>");
@@ -3813,7 +3848,7 @@ static void ir_lab_panel(FILE *f) {
     fprintf(f, "<div class='panel'><h3>Command queue</h3><div class='help'>Selected commands are saved if needed, then sent in small groups so Stop can cancel quickly. Duplicate IR codes are skipped even when databases use different names.</div><div class='lab-summary'><span id='labSummary'>0 queued</span><span>send group limit %d</span></div><div class='queue-tools'><button id='labSelectAll' type='button' class='ghost'>Select all</button><button id='labSelectNone' type='button' class='ghost'>Select none</button><button id='labDropUnchecked' type='button' class='ghost'>Remove unchecked</button></div><div id='labQueue' class='queue-list'><div class='muted mini'>No commands queued.</div></div>", MAX_IR_BATCH_COMMANDS);
     fprintf(f, "<div class='actions'><button id='labImport' type='button' class='secondary'>Save selected</button><button id='labRun' type='button'>Send selected</button><button id='labStop' type='button' class='danger'>Stop sending</button></div>");
     fprintf(f, "<pre id='labLog' class='mini' style='margin-top:12px;max-height:180px'>Ready.</pre></div></div></section>");
-    free(inv);
+    destroy_ir_inventory(inv);
 }
 
 static int safe_bt_store_id(const char *s) {
@@ -4371,7 +4406,13 @@ static void system_panel(FILE *f) {
 static void render_page(int fd, const char *message) {
     struct mqtt_config mqtt;
     struct wifi_config wifi;
-    FILE *f = fdopen(dup(fd), "w");
+    char *body = NULL;
+    size_t body_len = 0;
+    char hdr[200];
+    /* Buffer the page so we can send a Content-Length. If a render is ever cut
+     * short (e.g. an out-of-memory kill), no headers are emitted and the client
+     * sees a reset/short read instead of silently rendering a half page. */
+    FILE *f = open_memstream(&body, &body_len);
     if (!f) return;
     load_mqtt(&mqtt);
     load_wifi(&wifi);
@@ -4395,7 +4436,14 @@ static void render_page(int fd, const char *message) {
     backup_panel(f);
     system_panel(f);
     page_end(f);
-    fclose(f);
+    if (fclose(f) != 0 || !body) { free(body); return; }
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+        "Cache-Control: no-store\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
+        (unsigned long)body_len);
+    send_all(fd, hdr, strlen(hdr));
+    send_all(fd, body, body_len);
+    free(body);
 }
 
 static void handle_mqtt(int fd, const struct request *req) {
