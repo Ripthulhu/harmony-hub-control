@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Harmony Hub</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/profiles.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to controls</a>
+  <div class="shell">
+    <nav id="navigation" aria-label="Main navigation" hidden>
+      <span class="brand">Harmony Hub</span>
+      <a href="#remote" data-view="remote"><svg aria-hidden="true"><use href="/icons.svg#icon-Radio"></use></svg><span>Remote</span></a>
+      <a href="#devices" data-view="devices"><svg aria-hidden="true"><use href="/icons.svg#icon-Tv"></use></svg><span>Devices</span></a>
+      <a href="#activities" data-view="activities"><svg aria-hidden="true"><use href="/icons.svg#icon-Play"></use></svg><span>Activities</span></a>
+      <a href="#settings" data-view="settings"><svg aria-hidden="true"><use href="/icons.svg#icon-Settings"></use></svg><span>Settings</span></a>
+    </nav>
+    <main id="main" tabindex="-1">
+      <header class="topbar"><h1 id="title">Harmony Hub</h1><button id="connection" class="connection" type="button" title="Check connection">Connecting</button></header>
+      <div id="notice" role="status" aria-live="polite" hidden></div>
+      <div id="content" aria-busy="true"><p>Connecting to the hub...</p></div>
+    </main>
+  </div>
+  <dialog id="drawer" aria-labelledby="drawer-title"><div class="drawer-header"><h2 id="drawer-title">Commands</h2><button id="close-drawer" class="icon-button" title="Close commands" aria-label="Close commands"><svg aria-hidden="true"><use href="/icons.svg#icon-ChevronDown"></use></svg></button></div><label for="command-search">Search commands</label><input id="command-search" type="search" autocomplete="off"><div id="extra-commands"></div></dialog>
+</body>
+</html>

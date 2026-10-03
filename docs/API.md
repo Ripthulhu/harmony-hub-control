@@ -1,206 +1,91 @@
-# Local Control API
+# Local API
 
-The web UI intentionally has no HTTP authentication. Run it only on a trusted
-LAN or behind your own access controls.
+Use `/api/v1`. JSON bodies are bounded to 512 KiB; most command bodies are
+limited further. Responses describe hub acceptance, not IR reception.
 
-All write endpoints accept `application/x-www-form-urlencoded` bodies. JSON
-responses use `ok: true` on success and `ok: false` with `error` on failure.
+## Pairing
 
-## Inventory
+`GET /api/v1/session` reports pairing state, `buttonAvailable` and the current
+controller's `buttonPending` state. `POST /api/v1/controllers/request` with
+`{"name":"Phone","button":true}` starts a 90-second physical pairing request.
+A fresh short press/release of the hub's Pair button approves that one request.
+Every physically approved browser becomes an owner with full access.
+Only one physical request can wait at once; competing requests return 409.
+Restarting the service clears the physical approval window.
 
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/inventory"
+As a fallback on an unclaimed hub,
+`POST /api/v1/controllers/claim` accepts `{"name":"Phone","code":"<installer-code>"}`.
+Requests and claims set an HttpOnly, SameSite=Strict controller cookie and return
+a CSRF token. Without `button:true`, `controllers/request` needs an existing owner
+and waits for approval in Settings. A pending browser can cancel its own request
+through `controllers/cancel` using its cookie and CSRF token.
+An existing control-only browser can POST `controllers/upgrade` with its cookie
+and CSRF token, then press Pair to become an owner without changing its identity.
+Cancelling or expiring this request leaves its existing control access unchanged.
+
+Authenticated requests send the cookie. Mutations also send
+`X-Harmony-CSRF: <token>` and a matching Origin. Host must be the numeric hub
+address and port; DNS aliases and cross-origin requests are rejected.
+
+## Endpoints
+
+| Path | Method | Purpose |
+| --- | --- | --- |
+| session | GET | Controller role and pairing state |
+| controllers | GET/POST | Owner list, approval and revocation |
+| devices | GET/POST | Inventory; owner create/update/delete |
+| bluetooth/devices | GET | Saved Bluetooth profiles |
+| bluetooth/pair | POST | Owner pairing/status actions |
+| commands/send | POST | Enqueue a saved IR tap/hold or Bluetooth key |
+| commands/save, commands/import | POST | Owner command editing/import |
+| commands/learn | POST | Owner IR capture |
+| activities/run | POST | Enqueue local activity or estimated-state repair |
+| activities/native | GET | Preserved original native activities |
+| operations?id=<id> | GET | Operation state/result |
+| operations | POST | Cancel or renew an owned hold |
+| configuration | GET/POST | Versioned local layouts and activities |
+| setup | POST | Choose keep or restore; fresh setup remains disabled |
+| backups/portable, backups/full | GET | Owner exports |
+| backups/restore | POST | Owner portable configuration restore |
+| integrations/mqtt | GET/POST | Owner optional integration settings |
+| network/wifi, network/confirm | POST | Owner network trial/confirmation |
+| maintenance/reboot | POST | Owner normal reboot |
+| updates/begin, updates/chunk, updates/apply | POST | Owner signed release activation |
+
+## Commands And Holds
+
+```json
+{"deviceId":"<saved-id>","command":"VolumeUp","transport":"ir","mode":"hold"}
 ```
 
-Returns hub limits, configured devices, command names, keycode/raw flags, and
-local command counts.
+The response contains an operation ID and initial `queued` state.
+Poll operations; terminal states are `completed`, `failed` and `cancelled`.
+Renew a hold every 250 ms with `{"id":"<id>","action":"keepalive"}`.
+Release with `action:"cancel"`. A lost lease stops after 1.2 seconds; every
+hold stops after 30 seconds. Only its controller or the owner can cancel it.
 
-List runnable commands for one device:
+Browser, activity and MQTT requests share one serialized command coordinator.
+Activities may queue child operations; cancelling or revoking their controller
+also stops the sequence. Bluetooth long holds are not advertised.
 
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/device-commands?deviceId=<device-id>"
-```
+## Configuration And Backups
 
-## IR Control
+Owner configuration mutations include the last observed `revision`.
+A stale revision returns 409 rather than overwriting another browser's work.
+Malformed imports, unsupported schemas and low storage are rejected.
 
-Send one saved command:
+Browser restore changes portable device/activity resources only. Sensitive
+exports contain Wi-Fi/MQTT settings, but restoring those credentials requires
+desktop recovery. Full installer ZIP backups use `restore_backup.py`.
 
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/ir-send" -Method Post -Body @{
-  deviceId = "<device-id>"
-  command  = "PowerOff"
-}
-```
+Wi-Fi changes retain the previous configuration for 90 seconds. Confirmation
+requires the requested network to be connected; otherwise the old network is
+restored. A reboot with an unconfirmed trial also restores it.
 
-Send a cancellable batch:
+## Compatibility
 
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/ir-batch-send" -Method Post -Body @{
-  deviceId = "<device-id>"
-  commands = "PowerOff`nInputHdmi1"
-  delayMs  = "80"
-  dryRun   = "0"
-  runId    = "example-run-1"
-}
-```
+The old inventory/device-command reads and `/api/ir-send` /
+`/api/bt-saved-command` are authenticated adapters. Older unprotected write,
+raw protocol and MD5 update routes are removed. New integrations should use v1.
 
-The response includes `sent`, `attempted`, `skipped`, `failed`, `elapsedMs`, and
-`lastReply`. `failed` is incremented when the hub rejects a stored command, so
-large sweeps can keep going while still showing unsupported names clearly.
-
-Cancel a running batch:
-
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/ir-cancel" -Method Post -Body @{
-  runId = "example-run-1"
-}
-```
-
-Create or reuse the temporary IR sweep target:
-
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/ir-lab-target" -Method Post
-```
-
-Import commands from database-converted lines:
-
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/irdb-import" -Method Post -Body @{
-  deviceId = "<device-id>"
-  payload  = "PowerOff|G:Toshiba 32 Bit:(0xE0E040BF)(Repeat)():3"
-}
-```
-
-Raw timing imports use:
-
-```text
-CommandName|raw|F9470P20D0S1068...
-```
-
-## IR Learning
-
-Capture from a remote:
-
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/capture" -Method Post -Body @{
-  timeout = "8"
-}
-```
-
-Test a learned signal before saving:
-
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/ir-test-learned" -Method Post -Body @{
-  deviceId = "<device-id>"
-  name     = "PowerToggle"
-  mode     = "raw"
-  raw      = "F9470P20D0S1068..."
-}
-```
-
-## Bluetooth HID
-
-Make the hub discoverable and pairable as a keyboard:
-
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/bt-call" -Method Post -Body @{
-  action = "pairing_on"
-  type   = "btkeyboard"
-  name   = "Harmony Keyboard"
-}
-```
-
-Check adapter and connection state:
-
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/bt-call" -Method Post -Body @{
-  action = "adapter_status"
-}
-```
-
-Check the FIFO keyboard runtime:
-
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/bt-text-status"
-```
-
-Send exact text through the keyboard FIFO runtime:
-
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/bt-text" -Method Post -Body @{
-  text = "Hello World`n"
-}
-```
-
-The installer starts `/data/codex/bin/codex_bthid_keyboard` automatically and
-creates `/cache/bin/bthid_keyboard` as a friendly symlink. The runtime reads
-`/tmp/bthid_input`, sends exact press/release reports for ASCII text, and uses
-the paired target saved by the Bluetooth controls.
-
-Send a named key or shortcut through the low-level HID report path:
-
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/bt-call" -Method Post -Body @{
-  action = "report"
-  type   = "btkeyboard"
-  code   = "ctrl+l"
-}
-```
-
-Send multiple named keys. Each key is encoded as a press and release pair:
-
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/bt-call" -Method Post -Body @{
-  action = "reportseq"
-  type   = "btkeyboard"
-  code   = "enter`nspace`nalt+f4"
-  gapMs  = "35"
-}
-```
-
-## Exports
-
-```text
-GET /export/bundle
-GET /export/devices
-GET /export/functions
-GET /export/protocols
-GET /export/mqtt
-GET /export/wifi
-GET /export/cloud
-```
-
-Exports are for backups and debugging. Do not share files containing local
-network or credential material.
-
-`/export/cloud` returns `1` when the Logitech cloud blocker is enabled and `0`
-when cloud tasks are allowed on the next network start.
-
-## Software Updates
-
-The System page can update the local control stack from this repository. The
-browser fetches `payload/bin/MANIFEST.txt` and selected `codex_*` binaries,
-uploads them to the hub in chunks, then the hub verifies MD5 hashes from the
-manifest before installing. The default updater tries the GitHub contents API,
-raw GitHub, and jsDelivr mirrors so public updates still work when one browser
-fetch path is blocked.
-
-Low-level SSH/dropbear files are intentionally not updated by the web UI.
-
-```powershell
-Invoke-RestMethod "http://<hub-ip>:8080/api/update-status"
-```
-
-The chunked update endpoints are:
-
-```text
-POST /api/update-begin
-POST /api/update-chunk
-POST /api/update-apply
-```
-
-The default public GitHub repository is read through GitHub's Contents API and
-works without a token. For a private GitHub repo or fork, paste a GitHub token
-into the System page update field. It is used only by the browser to read GitHub
-and is not sent to or stored on the hub. Change the raw base URL only when using
-a public mirror.
+Pairing is not encryption. This service remains trusted-LAN HTTP.

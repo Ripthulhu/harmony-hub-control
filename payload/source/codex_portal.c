@@ -1,229 +1,36 @@
 #include <arpa/inet.h>
-#include <ctype.h>
-#include <errno.h>
 #include <netinet/in.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include <sys/time.h>
 #include <unistd.h>
 
-static const char *page =
-    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
-    "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Harmony Recovery</title><style>"
-    "body{font-family:sans-serif;margin:2rem;max-width:34rem}label{display:block;margin:.9rem 0 .3rem}"
-    "input{font-size:1rem;padding:.55rem;width:100%;box-sizing:border-box}button{margin-top:1rem;padding:.7rem 1rem;font-size:1rem}"
-    "</style></head><body><h1>Harmony Wi-Fi Recovery</h1>"
-    "<form method='post' action='/wifi'>"
-    "<label>SSID</label><input name='ssid' required>"
-    "<label>Password</label><input name='password' type='password'>"
-    "<label><input name='hidden' type='checkbox' value='1' style='width:auto'> Hidden network</label>"
-    "<button type='submit'>Save and reboot</button></form></body></html>";
+static const char page[] =
+    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n"
+    "<!doctype html><html lang='en'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Harmony Recovery</title><body><h1>USB Network Recovery</h1>"
+    "<p>This recovery network is not encrypted. It cannot accept Wi-Fi passwords.</p>"
+    "<p>Connect the hub to your computer over USB and choose Provision Wi-Fi in the Harmony Hub Tool.</p>"
+    "<p>A factory reset removes local settings and may remove this installation.</p></body></html>";
 
-static int hexval(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-static void url_decode(char *s) {
-    char *r = s;
-    char *w = s;
-    while (*r) {
-        if (*r == '+') {
-            *w++ = ' ';
-            r++;
-        } else if (*r == '%' && isxdigit((unsigned char)r[1]) && isxdigit((unsigned char)r[2])) {
-            *w++ = (char)(hexval(r[1]) * 16 + hexval(r[2]));
-            r += 3;
-        } else {
-            *w++ = *r++;
-        }
-    }
-    *w = 0;
-}
-
-static void form_value(const char *body, const char *name, char *out, size_t outlen) {
-    size_t namelen = strlen(name);
-    const char *p = body;
-    out[0] = 0;
-    while (p && *p) {
-        const char *eq = strchr(p, '=');
-        const char *amp = strchr(p, '&');
-        size_t keylen;
-        size_t vallen;
-        if (!eq) return;
-        if (amp && amp < eq) {
-            p = amp + 1;
-            continue;
-        }
-        keylen = (size_t)(eq - p);
-        if (keylen == namelen && strncmp(p, name, namelen) == 0) {
-            const char *vstart = eq + 1;
-            const char *vend = amp ? amp : p + strlen(p);
-            vallen = (size_t)(vend - vstart);
-            if (vallen >= outlen) vallen = outlen - 1;
-            memcpy(out, vstart, vallen);
-            out[vallen] = 0;
-            url_decode(out);
-            return;
-        }
-        p = amp ? amp + 1 : NULL;
-    }
-}
-
-static void write_quoted(FILE *f, const char *s) {
-    fputc('"', f);
-    while (*s) {
-        if (*s == '"' || *s == '\\') {
-            fputc('\\', f);
-        }
-        fputc(*s, f);
-        s++;
-    }
-    fputc('"', f);
-}
-
-static int save_wifi(const char *ssid, const char *password, int hidden) {
-    FILE *f = fopen("/etc/wpa_supplicant.conf", "w");
-    if (!f) {
-        return -1;
-    }
-    fprintf(f, "ctrl_interface=/var/run/wpa_supplicant\n");
-    fprintf(f, "ap_scan=1\n\n");
-    fprintf(f, "network={\n");
-    fprintf(f, "\tssid=");
-    write_quoted(f, ssid);
-    fprintf(f, "\n");
-    if (hidden) {
-        fprintf(f, "\tscan_ssid=1\n");
-    }
-    if (password && password[0]) {
-        fprintf(f, "\tkey_mgmt=WPA-PSK\n\tpsk=");
-        write_quoted(f, password);
-        fprintf(f, "\n");
-    } else {
-        fprintf(f, "\tkey_mgmt=NONE\n");
-    }
-    fprintf(f, "}\n");
-    fclose(f);
-    chmod("/etc/wpa_supplicant.conf", 0600);
-    sync();
-    return 0;
-}
-
-static int content_length(const char *headers) {
-    const char *needle = "Content-Length:";
-    const char *p = headers;
-    size_t nlen = strlen(needle);
-    while (*p) {
-        size_t i;
-        for (i = 0; i < nlen; i++) {
-            if (!p[i] || tolower((unsigned char)p[i]) != tolower((unsigned char)needle[i])) {
-                break;
-            }
-        }
-        if (i == nlen) {
-            break;
-        }
-        p++;
-    }
-    if (!*p) return 0;
-    p += 15;
-    while (*p == ' ' || *p == '\t') p++;
-    return atoi(p);
-}
-
-static void send_text(int fd, const char *status, const char *body) {
-    char hdr[256];
-    snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 %s\r\nContent-Type: text/plain\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
-        status, (unsigned long)strlen(body));
-    send(fd, hdr, strlen(hdr), 0);
-    send(fd, body, strlen(body), 0);
-}
-
-static void handle_client(int client) {
-    char buf[8192];
-    int n;
-    char *body;
-    int clen;
-    n = recv(client, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) return;
-    buf[n] = 0;
-    if (strncmp(buf, "GET ", 4) == 0) {
-        send(client, page, strlen(page), 0);
-        return;
-    }
-    if (strncmp(buf, "POST /wifi ", 11) != 0) {
-        send_text(client, "404 Not Found", "not found\n");
-        return;
-    }
-    body = strstr(buf, "\r\n\r\n");
-    if (!body) {
-        send_text(client, "400 Bad Request", "bad request\n");
-        return;
-    }
-    body += 4;
-    clen = content_length(buf);
-    while ((int)strlen(body) < clen && n < (int)sizeof(buf) - 1) {
-        int got = recv(client, buf + n, sizeof(buf) - 1 - n, 0);
-        if (got <= 0) break;
-        n += got;
-        buf[n] = 0;
-    }
-    {
-        char ssid[256];
-        char password[256];
-        char hidden[16];
-        form_value(body, "ssid", ssid, sizeof(ssid));
-        form_value(body, "password", password, sizeof(password));
-        form_value(body, "hidden", hidden, sizeof(hidden));
-        if (!ssid[0]) {
-            send_text(client, "400 Bad Request", "missing ssid\n");
-            return;
-        }
-        if (save_wifi(ssid, password, hidden[0] != 0) == 0) {
-            send_text(client, "200 OK", "saved; rebooting\n");
-            system("/sbin/reboot");
-        } else {
-            send_text(client, "500 Internal Server Error", "failed to save wifi\n");
-        }
-    }
-}
-
-int main(int argc, char **argv) {
-    int port = argc > 1 ? atoi(argv[1]) : 80;
-    int fd;
-    int one = 1;
-    struct sockaddr_in addr;
-    fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        perror("socket");
-        return 1;
-    }
+int main(void) {
+    signal(SIGPIPE, SIG_IGN);
+    struct sockaddr_in address; int fd = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+    if (fd < 0) return 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((unsigned short)port);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        perror("bind");
-        return 1;
-    }
-    if (listen(fd, 8) != 0) {
-        perror("listen");
-        return 1;
-    }
-    fprintf(stderr, "codex_portal listening on %d\n", port);
+    memset(&address, 0, sizeof(address)); address.sin_family = AF_INET;
+    address.sin_port = htons(80); inet_pton(AF_INET, "192.168.76.1", &address.sin_addr);
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) || listen(fd, 4)) return 1;
     while (1) {
-        int client = accept(fd, NULL, NULL);
+        char request[1024]; int client = accept(fd, NULL, NULL); ssize_t n;
+        struct timeval timeout = {2, 0};
         if (client < 0) continue;
-        handle_client(client);
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        n = recv(client, request, sizeof(request), 0);
+        if (n >= 4 && !memcmp(request, "GET ", 4)) send(client, page, sizeof(page) - 1, 0);
+        else { const char error[] = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"; send(client, error, sizeof(error) - 1, 0); }
         close(client);
     }
 }

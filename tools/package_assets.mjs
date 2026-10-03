@@ -1,0 +1,15 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const decode = source => [...source.matchAll(/^\s*"((?:\\.|[^"\\])*)"\s*;?\s*$/gm)].map(m => JSON.parse('"'+m[1]+'"')).join('');
+const iconSource = fs.readFileSync(path.join(root, 'payload/source/lucide_icons.h'), 'utf8');
+const icons = decode(iconSource);
+if (!icons.includes('icon-Power')) throw Error('Lucide symbols missing');
+const license = iconSource.slice(2, iconSource.indexOf('*/')).trim().replace(/-{2,}/g, '-');
+fs.writeFileSync(path.join(root, 'payload/www/icons.svg'), '<!-- '+license+' -->\n<svg xmlns="http://www.w3.org/2000/svg">'+icons+'</svg>\n');
+const legacy = decode(fs.readFileSync(path.join(root, 'payload/source/codex_webui.c'), 'utf8'));
+const start = legacy.indexOf('const IRDB_BASE'), end = legacy.indexOf('async function postJson');
+if (start < 0 || end <= start) throw Error('Tested profile parser missing');
+fs.writeFileSync(path.join(root, 'payload/www/profiles.js'), '/* Generated from the tested stock-format parsers. */\n(()=>{const $=id=>document.getElementById(id);'+legacy.slice(start,end)+'\nwindow.harmonyParseProfile=parseIrText;})();\n');
+console.log('Packaged local Lucide symbols and profile parsers.');

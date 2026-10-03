@@ -65,6 +65,7 @@ local function maybeStartCloudTasks()
 end
 
 local function logWifiEvent(name, id)
+  if cloudBlockerEnabled() then return end
   local usageLog = require("tasks.crashlog.apihandler.usagelog")
   local t = {
     category = "hub connectivity",
@@ -88,8 +89,10 @@ local function handleEvent(event)
     end
 
     local uuid = system.uniqueId()
-    local usageLog = require("tasks.crashlog.apihandler.usagelog")
-    usageLog.setUniqueId("wifi", uuid)
+    if not cloudBlockerEnabled() then
+      local usageLog = require("tasks.crashlog.apihandler.usagelog")
+      usageLog.setUniqueId("wifi", uuid)
+    end
     logWifiEvent("connect wifi", uuid)
 
     if ipaddr ~= event.address and event.label ~= "lo" then
@@ -116,6 +119,7 @@ local function handleEvent(event)
       log.notice("starting LTCP Server task")
       ltcpServerConnector = system.loadTask("tasks/connectserver/transport/ltcpserverconnector.lua")
     end
+    require("tasks.codex.localcore").start()
 
     if event.label ~= "lo" then
       maybeStartCloudTasks()
@@ -128,17 +132,27 @@ local function handleEvent(event)
     log.notice(event.label .. ":deladdr", event.address)
     if event.label ~= "lo" then
       session.setIp(nil)
-      local usageLog = require("tasks.crashlog.apihandler.usagelog")
-      logWifiEvent("disconnect wifi", usageLog.getUniqueId("wifi"))
+      if not cloudBlockerEnabled() then
+        local usageLog = require("tasks.crashlog.apihandler.usagelog")
+        logWifiEvent("disconnect wifi", usageLog.getUniqueId("wifi"))
+      end
     end
   end
 end
 
 if mfgData.hasNetwork == true then
+  require("tasks.codex.localcore").start()
+  local waited = 0
   while not system.isMessageRegistered("config_unload") or not system.isMessageRegistered("get_setup_account") do
-    system.yield()
+    if waited >= 600 then
+      log.notice("local engine readiness timed out; starting network services in degraded mode")
+      break
+    end
+    system.sleep(100); waited = waited + 1
   end
   local netlink = system.netlinkOpen()
+  local current = system.getNetworkAttribute("ipaddr")
+  if current and current ~= "0.0.0.0" then handleEvent({family = "inet", label = "ath0", msgtype = "newaddr", address = current}) end
   while true do
     system.yieldSocketRecv(netlink)
     local events = netlink:receive()
@@ -163,6 +177,7 @@ if mfgData.hasNetwork == true then
   end
   netlink:close()
 else
+  require("tasks.codex.localcore").start()
   log.notice("starting HAL task")
   halConnect = system.loadTask("tasks/connectserver/transport/halhttpserverconnector.lua")
   log.notice("starting HBUS over HTTP server task")

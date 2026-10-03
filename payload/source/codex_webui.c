@@ -11,6 +11,8 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/select.h>
+#include <sys/file.h>
+#include <sys/statvfs.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -20,25 +22,54 @@
 #include <unistd.h>
 
 #include "remote_skin_jpg.h"
+#include "lucide_icons.h"
 
+#ifndef MQTT_CONFIG
 #define MQTT_CONFIG "/data/codexmqtt/config.json"
+#endif
+#ifndef WPA_CONFIG
 #define WPA_CONFIG "/etc/wpa_supplicant.conf"
+#endif
+#ifndef HUB_ID_FILE
 #define HUB_ID_FILE "/data/codex/hub_id"
+#endif
 #define CLOUD_BLOCKER_CONFIG "/data/codex/cloud_blocker.conf"
 #define WEBUI_AUTH_CONFIG "/data/codex/webui_auth.conf"
 #define UPDATE_STATE_CONFIG "/data/codex/update_state.conf"
+#ifndef DEVICE_LIST
 #define DEVICE_LIST "/data/resources/DeviceList.json"
+#endif
+#ifndef FUNCTION_LIST
 #define FUNCTION_LIST "/data/resources/FunctionList.json"
+#endif
+#ifndef PROTOCOL_LIST
 #define PROTOCOL_LIST "/data/resources/ProtocolList.json"
+#endif
+#ifndef ACTIVITY_LIST
+#define ACTIVITY_LIST "/data/resources/ActivityList.json"
+#endif
+#ifndef MAP_LIST
+#define MAP_LIST "/data/resources/MapList.json"
+#endif
+#ifndef RESOURCE_RELOAD_FLAG
 #define RESOURCE_RELOAD_FLAG "/data/codex/reload_resources"
+#endif
 #define RESOURCE_BACKUP_DIR "/data/codex/resource-backups"
 #define IR_EVENT_LOG "/data/codex/ir-events.log"
 #define IR_CANCEL_PREFIX "/tmp/codex_ir_cancel_"
+#define IR_HOLD_PREFIX "/tmp/codex_ir_hold_"
+#ifndef IR_SEND_LOCK
+#define IR_SEND_LOCK "/tmp/codex_ir_send.lock"
+#endif
 #define BT_TEXT_FIFO "/tmp/bthid_input"
 #define BT_TEXT_STATUS "/tmp/bthid_status"
 #define BT_TARGET_FILE "/data/codex/bthid_target"
+#ifndef BT_DEVICE_STORE
 #define BT_DEVICE_STORE "/data/codex/bt-devices.json"
+#endif
+#ifndef CODEX_BIN_DIR
 #define CODEX_BIN_DIR "/data/codex/bin"
+#endif
 #define UPDATE_STAGE_DIR "/tmp/codex_update"
 #define UPDATE_BACKUP_DIR "/data/codex/update-backups"
 #define IR_EVENT_MAX_BYTES 65536
@@ -73,6 +104,7 @@ struct request {
     char method[8];
     char path[256];
     char auth[512];
+    char host[128], origin[256], cookie[512], csrf[80], revision[32];
     int body_truncated;
     char *body;
     size_t body_len;
@@ -220,23 +252,32 @@ static char *read_file_alloc(const char *path, size_t maxlen, size_t *outlen) {
 }
 
 static int write_file_atomic(const char *path, const char *data, size_t len) {
-    char tmp[256];
+    char tmp[320];
     FILE *f;
-    snprintf(tmp, sizeof(tmp), "%s.new", path);
-    f = fopen(tmp, "wb");
+    int fd, rc, parent;
+    char dir[256], *slash;
+    snprintf(tmp, sizeof(tmp), "%s.new-XXXXXX", path);
+    fd = mkstemp(tmp);
+    if (fd < 0) return -1;
+    f = fdopen(fd, "wb");
+    if (!f) { close(fd); unlink(tmp); return -1; }
     if (!f) return -1;
     if (fwrite(data, 1, len, f) != len) {
         fclose(f);
         unlink(tmp);
         return -1;
     }
-    fputc('\n', f);
-    fclose(f);
+    rc = fflush(f);
+    if (rc == 0) rc = fsync(fileno(f));
+    if (fclose(f) != 0) rc = -1;
+    if (rc != 0) { unlink(tmp); return -1; }
     if (rename(tmp, path) != 0) {
         unlink(tmp);
         return -1;
     }
-    sync();
+    snprintf(dir, sizeof(dir), "%s", path);
+    slash = strrchr(dir, '/');
+    if (slash) { *slash = 0; parent = open(dir, O_RDONLY); if (parent >= 0) { fsync(parent); close(parent); } }
     return 0;
 }
 
@@ -1557,11 +1598,29 @@ static void render_device_commands_json(int fd, const struct request *req) {
 static void render_capture_json(int fd) {
     char reply[4096];
     char mode[16], keycode[512], nec[64], summary[160];
+    const char *p; int has_timing = 0;
     int protocol_id = 2;
-    FILE *f = send_json_start(fd, "200 OK");
-    if (!f) return;
+    FILE *f;
     capture_ir_command_action(reply, sizeof(reply));
+    for (p = reply; *p && !has_timing; p++) if (*p == 'F' && isxdigit((unsigned char)p[1])) {
+        const char *end = p + 1; int timings = 0;
+        while (isxdigit((unsigned char)*end)) end++;
+        while ((*end == 'P' || *end == 'S') && isxdigit((unsigned char)end[1])) {
+            timings++; end++; while (isxdigit((unsigned char)*end)) end++;
+        }
+        if (timings >= 4 && (size_t)(end - p) < sizeof(reply)) {
+            size_t n = end - p; memmove(reply, p, n); reply[n] = 0; has_timing = 1;
+        }
+    }
     analyze_capture_storage(reply, "", "", "2", mode, sizeof(mode), keycode, sizeof(keycode), nec, sizeof(nec), &protocol_id, summary, sizeof(summary));
+    if (!has_timing && !keycode[0] && !nec[0]) {
+        f = send_json_start(fd, "502 Bad Gateway");
+        if (f) { fputs("{\"ok\":false,\"error\":", f); json_write_string(f, reply[0] ? reply : "No IR signal received."); fputs("}", f); fclose(f); }
+        return;
+    }
+    if (has_timing) { strcpy(mode, "raw"); keycode[0] = nec[0] = 0; }
+    f = send_json_start(fd, "200 OK");
+    if (!f) return;
     fputs("{\"ok\":true,\"raw\":", f); json_write_string(f, reply);
     fputs(",\"mode\":", f); json_write_string(f, mode);
     fprintf(f, ",\"protocolId\":%d,\"keycode\":", protocol_id); json_write_string(f, keycode);
@@ -1660,18 +1719,17 @@ static void render_remotecentral_fetch_json(int fd, const struct request *req) {
     free(remote);
 }
 
+static int local_transaction_active, local_reload_deferred;
 static void request_resource_reload(void) {
-    FILE *f = fopen(RESOURCE_RELOAD_FLAG, "w");
-    if (f) {
-        fputs("DeviceList\nFunctionList\nProtocolList\n", f);
-        fclose(f);
-    }
+    const char *resources = "DeviceList\nFunctionList\nProtocolList\n";
+    if (local_transaction_active) { local_reload_deferred = 1; return; }
+    write_file_atomic(RESOURCE_RELOAD_FLAG, resources, strlen(resources));
     sync();
-    trigger_mqtt_discover();
 }
 
 static void backup_resources(void) {
     char cmd[512];
+    if (local_transaction_active) return;
     snprintf(cmd, sizeof(cmd),
         "mkdir -p " RESOURCE_BACKUP_DIR "; d=" RESOURCE_BACKUP_DIR "/$(date +%%Y%%m%%d_%%H%%M%%S); "
         "mkdir -p \"$d\"; cp " DEVICE_LIST " " FUNCTION_LIST " " PROTOCOL_LIST " \"$d\" 2>/dev/null");
@@ -1798,6 +1856,7 @@ static int protocol_file_has_id(int protocol_id) {
 }
 
 static int repair_known_protocols_for_current_commands(void) {
+    if (!local_transaction_active) return 0;
     char *devices = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, NULL);
     int need2, need679, missing2 = 0, missing679 = 0, changed = 0;
     if (!devices) return -1;
@@ -2830,25 +2889,71 @@ static void log_ir_note_event(const char *event, const char *source, const char 
     fclose(f);
 }
 
-static void send_ir_command_action_ex(const char *device_id, const char *command, const char *source, const char *run_id, char *out, size_t outlen) {
-    char hub_id[64];
-    char action[512], params[768], esc_id[128], esc_params[1024], cmd[1400];
-    if (!load_hub_id(hub_id, sizeof(hub_id))) {
-        snprintf(out, outlen, "Hub ID is missing. Re-run the root tool or reinstall with the numeric Hub ID printed as hub_id=...");
-        log_ir_event(source, run_id, device_id, command, out);
-        return;
+static int ir_reply_ok(const char *reply) {
+    char command[128];
+    return json_int(reply, "code", -1) == 200 &&
+        json_string(reply, "cmd", command, sizeof(command)) &&
+        strcmp(command, "harmony.engine?holdaction") == 0;
+}
+
+static int prepare_ir(char *hub_id, size_t idlen, char *out, size_t outlen) {
+    int i;
+    if (access(RESOURCE_RELOAD_FLAG, F_OK) == 0) trigger_mqtt_discover();
+    for (i = 0; i < 100; i++) {
+        if (access(RESOURCE_RELOAD_FLAG, F_OK) != 0 && access(RESOURCE_RELOAD_FLAG ".loading", F_OK) != 0) break;
+        usleep(100000);
     }
+    if (i == 100) {
+        snprintf(out, outlen, "Saved commands have not loaded into the hub. Restart the hub and try again.");
+        return -1;
+    }
+    if (!load_hub_id(hub_id, idlen)) {
+        snprintf(out, outlen, "Hub ID is missing. Re-run the root tool or reinstall with the numeric Hub ID printed as hub_id=...");
+        return -1;
+    }
+    return 0;
+}
+
+static int lock_ir(char *out, size_t outlen) {
+    int fd = open(IR_SEND_LOCK, O_CREAT | O_RDWR, 0600);
+    if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (fd >= 0) close(fd);
+        snprintf(out, outlen, "Another IR command is running.");
+        return -1;
+    }
+    return fd;
+}
+
+static int send_ir_command_unlocked(const char *device_id, const char *command, const char *source, const char *run_id, char *out, size_t outlen) {
+    char hub_id[64], action[512], params[768], esc_id[128], esc_params[1024], cmd[1400];
+    int rc;
+    if (prepare_ir(hub_id, sizeof(hub_id), out, outlen) != 0) return -1;
     snprintf(action, sizeof(action), "{\\\"type\\\":\\\"IRCommand\\\",\\\"deviceId\\\":\\\"%s\\\",\\\"command\\\":\\\"%s\\\"}", device_id, command);
     snprintf(params, sizeof(params), "{\"status\":\"pressrelease\",\"count\":1,\"action\":\"%s\"}", action);
     shell_escape_single(hub_id, esc_id, sizeof(esc_id));
     shell_escape_single(params, esc_params, sizeof(esc_params));
     snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hbus '%s' harmony.engine?holdaction '%s' 2>&1", esc_id, esc_params);
-    run_cmd(cmd, out, outlen);
+    rc = run_cmd(cmd, out, outlen);
     log_ir_event(source, run_id, device_id, command, out && out[0] ? out : "no response");
+    if (rc == 0 && ir_reply_ok(out)) return 0;
+    if (out[0] == '{') {
+        char error[512];
+        if (json_string(out, "msg", error, sizeof(error))) snprintf(out, outlen, "Hub rejected command: %s", error);
+        else snprintf(out, outlen, "Unexpected reply from the hub.");
+    } else if (!out[0]) snprintf(out, outlen, "No reply from the hub.");
+    return -1;
 }
 
-static void send_ir_command_action(const char *device_id, const char *command, char *out, size_t outlen) {
-    send_ir_command_action_ex(device_id, command, "webui", "", out, outlen);
+static int send_ir_command_action_ex(const char *device_id, const char *command, const char *source, const char *run_id, char *out, size_t outlen) {
+    int lock = lock_ir(out, outlen), rc;
+    if (lock < 0) return -1;
+    rc = send_ir_command_unlocked(device_id, command, source, run_id, out, outlen);
+    close(lock);
+    return rc;
+}
+
+static int send_ir_command_action(const char *device_id, const char *command, char *out, size_t outlen) {
+    return send_ir_command_action_ex(device_id, command, "webui", "", out, outlen);
 }
 
 static void capture_ir_command_action(char *out, size_t outlen) {
@@ -2866,6 +2971,16 @@ static void capture_ir_command_action(char *out, size_t outlen) {
     }
 }
 
+static void icon(FILE *f, const char *name) {
+    fprintf(f, "<svg class='icon' aria-hidden='true' width='22' height='22' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><use href='#icon-%s'/></svg>", name);
+}
+
+static void nav_button(FILE *f, const char *view, const char *label, const char *symbol) {
+    fprintf(f, "<button type='button' class='menu-item' data-view-target='%s'>", view);
+    icon(f, symbol);
+    fprintf(f, "<strong>%s</strong></button>", label);
+}
+
 static void page_head(FILE *f, const char *title) {
     int cloud_blocked = load_cloud_blocker();
     fprintf(f,
@@ -2879,7 +2994,7 @@ static void page_head(FILE *f, const char *title) {
         "*{box-sizing:border-box}html,body{width:100%;max-width:100%;overflow-x:hidden}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.48 system-ui,-apple-system,Segoe UI,sans-serif}"
         "header{position:sticky;top:0;background:rgba(255,255,255,.98);backdrop-filter:saturate(1.15) blur(12px);border-bottom:1px solid var(--line);padding:12px 20px;z-index:3}"
         ".topbar{max-width:1280px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:16px}.brand{display:flex;align-items:center;gap:11px}.brand-mark{width:34px;height:34px;border-radius:8px;background:var(--accent);display:grid;place-items:center;color:#fff;font-weight:750}.brand h1{letter-spacing:0}.brand small{display:block;color:var(--muted);font-size:12px}.top-status{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}"
-        ".app-shell{max-width:1280px;margin:0 auto;padding:22px 20px;display:grid;grid-template-columns:236px minmax(0,1fr);gap:22px}.side-menu{position:sticky;top:78px;align-self:start;display:grid;gap:5px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px;box-shadow:var(--shadow);min-width:0;max-width:100%}.menu-item{display:grid;grid-template-columns:34px 1fr;gap:10px;align-items:center;text-align:left;border:0;background:transparent;color:var(--fg);border-radius:8px;padding:10px 11px;box-shadow:none;min-height:54px}.menu-item>*{min-width:0}.menu-item:hover{background:var(--soft)}.menu-item span:first-child{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;background:#edf3f2;color:var(--accent);font-size:0;position:relative}.menu-item span:first-child:before{content:\"\";display:block;width:13px;height:13px;border:2px solid currentColor;border-radius:4px}.menu-item[data-view-target=control] span:first-child:before{width:16px;height:16px;border-radius:50%;box-shadow:inset 0 0 0 4px #fff}.menu-item[data-view-target=ir] span:first-child:before{width:15px;height:9px;border-radius:9px}.menu-item[data-view-target=lab] span:first-child:before{width:15px;height:15px;border-radius:50%;box-shadow:inset 0 0 0 3px #fff}.menu-item[data-view-target=bluetooth] span:first-child:before{width:15px;height:15px;border-radius:50%;border-width:2px;box-shadow:0 -5px 0 -3px currentColor,0 5px 0 -3px currentColor}.menu-item[data-view-target=mqtt] span:first-child:before{width:14px;height:14px;border-radius:50%;border-width:2px}.menu-item[data-view-target=wifi] span:first-child:before{width:15px;height:10px;border:0;border-top:2px solid currentColor;border-radius:50%}.menu-item[data-view-target=backup] span:first-child:before{width:15px;height:12px;border-radius:3px}.menu-item[data-view-target=system] span:first-child:before{width:13px;height:13px;border-radius:50%}.menu-item strong{display:block;font-size:13px;line-height:1.15;overflow-wrap:anywhere}.menu-item small{display:block;color:var(--muted);font-size:11px;margin-top:2px;line-height:1.15;overflow-wrap:anywhere}.menu-item.active{background:var(--soft2);color:#0c514d}.menu-item.active span:first-child{background:#fff;box-shadow:inset 0 0 0 1px rgba(15,118,110,.14)}.content{min-width:0;max-width:100%;display:grid;gap:18px}.section{display:none;scroll-margin-top:94px;min-width:0;max-width:100%}.section.active{display:grid;gap:15px}.section-head{display:flex;align-items:end;justify-content:space-between;gap:12px;padding:2px 0 4px}.section-lead{max-width:100%;color:var(--muted);font-size:13px;margin-top:5px;overflow-wrap:break-word}"
+        ".app-shell{max-width:1280px;margin:0 auto;padding:22px 20px;display:grid;grid-template-columns:236px minmax(0,1fr);gap:22px}.side-menu{position:sticky;top:78px;align-self:start;display:grid;gap:5px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px;box-shadow:var(--shadow);min-width:0;max-width:100%}.menu-item{display:grid;grid-template-columns:34px 1fr;gap:10px;align-items:center;text-align:left;border:0;background:transparent;color:var(--fg);border-radius:8px;padding:10px 11px;box-shadow:none;min-height:54px}.menu-item>*{min-width:0}.menu-item:hover{background:var(--soft)}.menu-item strong{display:block;font-size:13px;line-height:1.15;overflow-wrap:anywhere}.menu-item small{display:block;color:var(--muted);font-size:11px;margin-top:2px;line-height:1.15;overflow-wrap:anywhere}.menu-item.active{background:var(--soft2);color:#0c514d}.content{min-width:0;max-width:100%;display:grid;gap:18px}.section{display:none;scroll-margin-top:94px;min-width:0;max-width:100%}.section.active{display:grid;gap:15px}.section-head{display:flex;align-items:end;justify-content:space-between;gap:12px;padding:2px 0 4px}.section-lead{max-width:100%;color:var(--muted);font-size:13px;margin-top:5px;overflow-wrap:break-word}"
         "h1{font-size:20px;margin:0}h2{font-size:24px;line-height:1.12;margin:0;font-weight:750}h3{font-size:15px;margin:0 0 10px}.panel h2{font-size:18px;line-height:1.2;margin:0 0 6px}.muted{color:var(--muted)}.mini{font-size:12px}.nowrap{white-space:nowrap}.subtle{font-size:12px;color:var(--muted);margin-top:2px}.help{font-size:12px;color:var(--muted);margin-top:5px}.help,.muted,.subtle,.callout{overflow-wrap:anywhere}.callout{border:1px solid #dbe7ef;border-left:4px solid var(--accent2);background:#fbfdff;border-radius:8px;padding:12px 14px;margin:0 0 12px;color:#263a52}.callout strong{display:block;margin-bottom:2px}.quick-actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-top:14px}.quick-actions button{min-height:72px;text-align:left;background:#fff;color:var(--fg);border-color:var(--line);box-shadow:0 1px 2px rgba(20,40,32,.04);padding:14px}.quick-actions button strong{display:block;margin-bottom:4px}.quick-actions button:hover{border-color:#b9c8c4;background:#fbfefd}"
         ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.dashboard-cards{grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.panel,.stat,.setup-shell{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;box-shadow:0 1px 2px rgba(20,40,32,.04);min-width:0;max-width:100%}.panel>*,.stat>*,.setup-shell>*{min-width:0;max-width:100%}.stat{min-height:92px;padding:17px}.stat .value{font-size:20px;font-weight:700;margin-top:5px}.stat .label{text-transform:uppercase;letter-spacing:0;color:var(--muted);font-size:11px}"
         ".kv{display:grid;grid-template-columns:132px 1fr;gap:6px 10px}.badge,.pill{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:3px 9px;background:var(--wash);font-size:12px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}"
@@ -2888,18 +3003,35 @@ static void page_head(FILE *f, const char *title) {
         "button,a.button{border:1px solid var(--accent);background:var(--accent);color:#fff;border-radius:6px;padding:9px 12px;min-height:38px;cursor:pointer;font-weight:650;transition:border-color .12s,background .12s,box-shadow .12s,transform .08s;text-decoration:none;line-height:1.15}button:hover,a.button:hover{box-shadow:0 2px 8px rgba(15,118,110,.12)}button:active,a.button:active{transform:translateY(1px)}button:focus-visible,a.button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid rgba(15,118,110,.28);outline-offset:2px}a.button{display:inline-flex;align-items:center;justify-content:center}.secondary{background:#fff;color:var(--accent)}.danger{border-color:var(--bad);color:var(--bad);background:#fff}.ghost{background:var(--wash);border-color:var(--line);color:var(--fg)}"
         "pre{white-space:pre-wrap;word-break:break-word;margin:0;background:var(--soft);border-radius:6px;padding:10px;max-height:340px;overflow:auto}details{border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:11px 13px}summary{cursor:pointer;font-weight:650}"
         ".msg{border-left:4px solid var(--accent2);padding:10px 12px;background:#f8fbff;border-radius:8px}.table{width:100%;border-collapse:collapse}.table th,.table td{border-top:1px solid var(--line);padding:7px;text-align:left;vertical-align:top}.device-list{display:grid;gap:14px}.command-list{display:grid;gap:8px}.command{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;border-top:1px solid var(--line);padding-top:10px}.command .command-editor{grid-column:1/-1;background:var(--wash)}.command-editor{margin-top:10px}.command-preview{max-height:110px;background:#fff;border:1px solid var(--line);margin-top:6px}.bt-saved{grid-column:1/-1}.bt-device-card{border-top:1px solid var(--line);padding-top:14px;margin-top:14px}.bt-device-card h4{margin:0 0 4px;font-size:15px}.save-script-box{border-top:1px solid var(--line);padding-top:10px;margin-top:4px}.export-list{display:flex;gap:8px;flex-wrap:wrap}.hidden{display:none!important}.preview{display:grid;gap:6px;max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:8px;background:var(--soft)}.preview label{display:grid;grid-template-columns:auto 1fr;gap:8px;align-items:start;margin:0;color:var(--fg)}.match{width:100%;text-align:left;background:#fff;color:var(--fg);border-color:var(--line);padding:8px;white-space:normal;overflow-wrap:anywhere;word-break:break-word}.match strong{color:var(--accent2)}"
-        ".ir-stored-layout{display:grid;grid-template-columns:minmax(230px,.34fr) minmax(0,1fr);gap:14px;align-items:start;margin-bottom:15px}.ir-stored-layout>*,.ir-control-layout>*,.ir-device-workspace>*{min-width:0;max-width:100%}.ir-device-picks{display:grid;gap:8px}.ir-device-pick{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;text-align:left;background:#fff;color:var(--fg);border-color:var(--line);padding:11px}.ir-device-pick:hover,.ir-device-pick.active{background:var(--soft2);border-color:#b9d8d3}.ir-device-pick strong{display:block}.ir-device-workspace{display:none;gap:14px;min-width:0;max-width:100%}.ir-device-workspace.active{display:grid}.ir-work-head{display:flex;align-items:start;justify-content:space-between;gap:12px}.ir-control-layout{display:grid;grid-template-columns:minmax(250px,360px) minmax(0,1fr);gap:16px;align-items:start}.ir-remote-card{display:grid;justify-items:center;gap:10px;width:100%;min-width:0;max-width:100%}.ir-remote-card>.help{justify-self:stretch;width:100%;max-width:100%;white-space:normal}.ir-remote-shell{width:100%;display:grid;place-items:center;background:linear-gradient(180deg,#f7faf9,#edf3f1);border:1px solid var(--line);border-radius:8px;padding:10px}.ir-remote-skin{position:relative;width:min(100%,315px);aspect-ratio:591/1280}.ir-remote-skin img{display:block;width:100%;height:100%;object-fit:contain;border-radius:12px;box-shadow:0 14px 34px rgba(10,18,16,.18)}.remote-hotspot{position:absolute;min-height:0;padding:0;border-radius:999px;border:1px solid rgba(15,118,110,.55);background:rgba(15,118,110,.12);color:transparent;box-shadow:0 0 0 1px rgba(255,255,255,.18) inset;touch-action:manipulation;margin:0}.remote-hotspot button{width:100%;height:100%;min-height:0;padding:0;border:0;background:transparent;color:transparent;box-shadow:none;border-radius:inherit}.remote-hotspot button:hover{box-shadow:none}.remote-hotspot:hover,.remote-hotspot.sending{background:rgba(15,118,110,.28);border-color:#00a899;box-shadow:0 0 0 2px rgba(255,255,255,.5),0 8px 18px rgba(0,0,0,.2)}.remote-hotspot:focus-within{outline:2px solid #fff;outline-offset:2px}.remote-hotspot.disabled{background:transparent;border-color:transparent;box-shadow:none;cursor:default;pointer-events:none}.ir-quick-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:8px}.ir-remote-card .ir-quick-grid{width:100%}.ir-quick-grid .ir-send-form button{width:100%;background:#fff;color:var(--accent);border-color:var(--line);text-align:left;min-height:42px}.ir-quick-grid .ir-send-form button:hover,.ir-quick-grid .ir-send-form button.sending{background:var(--soft2);border-color:var(--accent)}.ir-unmapped{width:100%;border-top:1px solid var(--line);padding-top:10px}.ir-command-tools{display:grid;gap:10px}.ir-command-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;border-top:1px solid var(--line);padding-top:10px}.ir-command-row form{margin:0}.ir-status{min-height:20px}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}"
+        ".ir-stored-layout{display:grid;grid-template-columns:minmax(230px,.34fr) minmax(0,1fr);gap:14px;align-items:start;margin-bottom:15px}.ir-stored-layout>*,.ir-control-layout>*,.ir-device-workspace>*{min-width:0;max-width:100%}.ir-device-picks{display:grid;gap:8px}.ir-device-pick{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;text-align:left;background:#fff;color:var(--fg);border-color:var(--line);padding:11px}.ir-device-pick:hover,.ir-device-pick.active{background:var(--soft2);border-color:#b9d8d3}.ir-device-pick strong{display:block}.ir-device-workspace{display:none;gap:14px;min-width:0;max-width:100%}.ir-device-workspace.active{display:grid}.ir-work-head{display:flex;align-items:start;justify-content:space-between;gap:12px}.ir-control-layout{display:grid;grid-template-columns:minmax(250px,360px) minmax(0,1fr);gap:16px;align-items:start}.ir-quick-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:8px}.ir-quick-grid .ir-send-form button{width:100%;background:#fff;color:var(--accent);border-color:var(--line);text-align:left;min-height:42px}.ir-quick-grid .ir-send-form button:hover,.ir-quick-grid .ir-send-form button.sending{background:var(--soft2);border-color:var(--accent)}.ir-command-tools{display:grid;gap:10px}.ir-command-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;border-top:1px solid var(--line);padding-top:10px}.ir-command-row form{margin:0}.ir-status{min-height:20px}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}"
         ".setup-shell{padding:0;overflow:hidden}.wizard-top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line);background:#fff}.wizard-top h3{margin:0}.wizard-grid{display:grid;grid-template-columns:210px 1fr;min-height:420px}.stepper{border-right:1px solid var(--line);background:#f8fbfa;padding:12px;display:grid;align-content:start;gap:6px}.step{display:grid;grid-template-columns:28px 1fr;gap:9px;align-items:center;width:100%;text-align:left;background:transparent;color:var(--fg);border-color:transparent;padding:10px}.step span{width:26px;height:26px;border-radius:999px;display:grid;place-items:center;background:#fff;border:1px solid var(--line);color:var(--accent);font-weight:750}.step.active{background:#fff;border-color:var(--line);box-shadow:0 1px 2px rgba(20,40,32,.04)}.wizard-body{padding:18px;min-width:0;max-width:100%}.wizard-panel{display:none;min-width:0;max-width:100%}.wizard-panel.active{display:block}.wizard-status{min-height:20px;margin-top:10px;color:var(--muted)}.device-sync{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.guide-steps{display:grid;gap:8px;margin:10px 0 12px}.guide-step{display:grid;grid-template-columns:28px 1fr;gap:10px;align-items:start;border:1px solid var(--line);background:var(--wash);border-radius:8px;padding:9px 10px}.guide-step>*{min-width:0}.guide-step b{width:22px;height:22px;border-radius:999px;background:var(--soft2);color:var(--accent);display:grid;place-items:center;font-size:12px}.lab-layout,.bt-layout{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(320px,.95fr);gap:14px;min-width:0}.lab-layout>*,.bt-layout>*{min-width:0}.bt-script-layout{display:grid;grid-template-columns:1fr;gap:12px;min-width:0}.bt-script-tools{display:grid;gap:8px;align-content:start;min-width:0}.lab-toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.lab-quick{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:10px 0 12px}.lab-quick button{text-align:left;min-height:50px;background:#fff;color:var(--accent);border-color:var(--accent)}.lab-quick button:hover{background:#f8fbfa;border-color:#0b625c}.lab-quick button .queue-meta{color:var(--muted);font-weight:600}.lab-presets,.queue-tools{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.lab-presets button,.queue-tools button{padding:6px 9px;font-size:12px}.lab-advanced{margin-top:12px}.inline-check{display:inline-flex;align-items:center;gap:8px;margin-top:10px}.lab-summary{display:flex;justify-content:space-between;gap:10px;align-items:center;border:1px solid var(--line);border-radius:8px;background:var(--wash);padding:9px 10px;margin:8px 0;color:var(--muted);font-size:12px}.queue-list{display:grid;gap:7px;max-height:390px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:8px}.queue-row{display:grid;grid-template-columns:auto 1fr auto;gap:9px;align-items:start;background:#fff;border:1px solid var(--line);border-radius:7px;padding:8px}.queue-row strong{display:block}.queue-meta{color:var(--muted);font-size:11px;overflow-wrap:anywhere}.meter{height:8px;border-radius:999px;background:#e7eeec;overflow:hidden}.meter span{display:block;height:100%;width:0;background:var(--accent)}button:disabled{opacity:.55;cursor:not-allowed;transform:none}.kb-panel{width:100%;max-width:100%;min-width:0;margin-top:10px;overflow-x:auto;overflow-y:hidden;padding-bottom:6px;-webkit-overflow-scrolling:touch}.kb-row{display:flex;gap:3px;margin-bottom:3px;justify-content:flex-start;min-width:max-content}.kb-key{min-width:36px;height:38px;padding:0 6px;border:1px solid var(--line);border-radius:5px;background:#fff;cursor:pointer;font-size:12px;font-family:inherit;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .06s,color .06s;color:var(--fg)}.kb-key:hover{background:var(--soft);border-color:var(--accent)}.kb-key.kb-on{background:var(--accent);color:#fff;border-color:var(--accent)}.kb-15{min-width:54px}.kb-2{min-width:72px}.kb-225{min-width:82px}.kb-25{min-width:90px}.kb-275{min-width:100px}.kb-sp{flex:1;min-width:180px;max-width:360px}.kb-fwd{margin-bottom:8px}"
-        "@media(max-width:980px){.ir-stored-layout,.ir-control-layout{grid-template-columns:minmax(0,1fr)}.ir-remote-skin{width:min(100%,250px)}}"
+        "@media(max-width:980px){.ir-stored-layout,.ir-control-layout{grid-template-columns:minmax(0,1fr)}}"
         "@media(max-width:860px){header{padding:12px 14px}.topbar{max-width:none;width:100%}.app-shell{width:100%;max-width:100%;grid-template-columns:minmax(0,1fr);padding:14px;gap:16px}.side-menu{position:sticky;top:62px;z-index:2;display:flex;max-width:100%;overflow-x:auto;gap:6px;border-radius:10px;box-shadow:0 4px 16px rgba(25,41,37,.06);scrollbar-width:thin}.menu-item{min-width:168px}.row,.wizard-grid,.device-sync,.lab-layout,.bt-layout,.bt-script-layout{grid-template-columns:minmax(0,1fr)}.kv{grid-template-columns:1fr}.command,.ir-command-row{grid-template-columns:1fr}.stepper{border-right:0;border-bottom:1px solid var(--line);grid-template-columns:repeat(2,1fr)}}"
-        "@media(max-width:520px){body{font-size:13px}header{position:static;padding:10px}.topbar{align-items:flex-start;flex-direction:column;gap:8px}.brand-mark{width:30px;height:30px}.brand h1{font-size:16px}.top-status{justify-content:flex-start}.app-shell{padding:10px;gap:14px}.side-menu{position:static;display:grid;grid-template-columns:minmax(0,1fr);gap:7px;padding:7px}.menu-item{min-width:0;min-height:46px;padding:8px;grid-template-columns:28px 1fr}.menu-item span:first-child{width:24px;height:24px}.menu-item strong{font-size:12px}.menu-item small{font-size:10px}.section-head,.ir-work-head{align-items:flex-start;flex-direction:column}.panel,.stat,.wizard-body{padding:14px}.grid,.cards,.quick-actions,.lab-toolbar,.lab-quick{grid-template-columns:minmax(0,1fr)}.guide-step{grid-template-columns:24px 1fr;padding:8px}.actions button,.actions a.button{width:100%}.ir-quick-grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.ir-remote-shell{padding:8px}.ir-remote-skin{width:min(100%,230px)}.kb-panel{margin-left:-2px;margin-right:-2px}.kb-key{min-width:32px;height:36px;font-size:11px}.kb-15{min-width:48px}.kb-2{min-width:64px}.kb-225{min-width:74px}.kb-sp{min-width:150px}}"
+        "@media(max-width:520px){body{font-size:13px}header{position:static;padding:10px}.topbar{align-items:flex-start;flex-direction:column;gap:8px}.brand-mark{width:30px;height:30px}.brand h1{font-size:16px}.top-status{justify-content:flex-start}.app-shell{padding:10px;gap:14px}.side-menu{position:static;display:grid;grid-template-columns:minmax(0,1fr);gap:7px;padding:7px}.menu-item{min-width:0;min-height:46px;padding:8px;grid-template-columns:28px 1fr}.menu-item strong{font-size:12px}.menu-item small{font-size:10px}.section-head,.ir-work-head{align-items:flex-start;flex-direction:column}.panel,.stat,.wizard-body{padding:14px}.grid,.cards,.quick-actions,.lab-toolbar,.lab-quick{grid-template-columns:minmax(0,1fr)}.guide-step{grid-template-columns:24px 1fr;padding:8px}.actions button,.actions a.button{width:100%}.ir-quick-grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.kb-panel{margin-left:-2px;margin-right:-2px}.kb-key{min-width:32px;height:36px;font-size:11px}.kb-15{min-width:48px}.kb-2{min-width:64px}.kb-225{min-width:74px}.kb-sp{min-width:150px}}"
         "@media(max-width:420px){.side-menu{grid-template-columns:minmax(0,1fr)}.menu-item{min-height:46px}}"
+        ":root{--bg:#f6f7f8;--fg:#232629;--muted:#62696f;--line:#dfe3e6;--panel:#fff;--soft:#f0f2f4;--soft2:#e8f3ef;--accent:#24755b;--accent2:#356a99}"
+        ".icon{flex-shrink:0;vertical-align:middle}.app-shell{grid-template-columns:184px minmax(0,1fr);gap:30px}.side-menu{background:none;border:0;border-radius:0;box-shadow:none;padding:0}.menu-item{grid-template-columns:24px 1fr;min-height:44px;padding:10px;gap:10px}.menu-item.active{background:var(--soft2)}.nav-more{border:0;background:none;padding:0;margin-top:18px}.nav-more summary{padding:10px;color:var(--muted);font-size:12px}.nav-more .menu-item{width:100%}.panel,.setup-shell{border:0;border-radius:0;box-shadow:none;background:transparent;padding:16px 0;border-top:1px solid var(--line)}.section-head{padding:6px 0 14px}.section-lead,.callout,.brand small{display:none}.panel .panel{padding:0}.ir-stored-layout{grid-template-columns:180px minmax(0,1fr);gap:26px}.ir-stored-layout>.panel{border:0;padding:0}.ir-device-pick{border:0;border-radius:6px;min-height:56px}.ir-work-head h3{font-size:22px;margin-bottom:4px}.ir-work-head .actions{margin:0}.ir-control-layout{grid-template-columns:minmax(240px,320px) minmax(0,1fr);gap:32px}.ir-status{padding:10px 12px;background:var(--soft);border-radius:6px;min-height:40px;color:var(--muted)}.ir-status[data-state=error]{background:#fcecec;color:#9d2525}.ir-status[data-state=success]{background:#e8f3ef;color:#185c46}.remote-pad{display:grid;gap:20px;padding:22px;background:white;border:1px solid var(--line);border-radius:8px;width:100%;max-width:320px}.remote-row{display:flex;justify-content:space-between;gap:8px;align-items:center}.remote-row form{flex:1}.remote-pad button{background:#f7f8f9;color:var(--fg);border-color:var(--line);width:100%;height:48px;min-width:0;padding:8px;display:grid;place-items:center;touch-action:none}.remote-pad button:hover{background:#e8f3ef;border-color:var(--accent)}.remote-pad button.sending{background:var(--accent);color:white}.remote-pad .power-key{color:#a52a35;background:#fff2f3;border-color:#f2d3d6}.remote-middle{display:grid;grid-template-columns:42px minmax(0,1fr) 42px;gap:10px;align-items:center}.remote-rocker{display:grid;gap:8px;text-align:center;font-size:10px;font-weight:650;color:var(--muted)}.remote-dpad{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(3,46px);gap:3px}.remote-dpad button{height:46px;padding:4px}.remote-dpad .up{grid-column:2}.remote-dpad .left{grid-column:1;grid-row:2}.remote-dpad .center{grid-column:2;grid-row:2}.remote-dpad .right{grid-column:3;grid-row:2}.remote-dpad .down{grid-column:2;grid-row:3}.remote-dpad .center button{background:var(--accent);color:white;border-color:var(--accent);font-size:13px}.remote-colors{display:flex;gap:12px}.remote-colors form{flex:1}.remote-colors button{height:30px;min-height:30px}.remote-colors .red{background:#bf3d46}.remote-colors .green{background:#27805c}.remote-colors .yellow{background:#daa728}.remote-colors .blue{background:#347bb7}.remote-thumb{width:24px;height:52px;object-fit:contain;opacity:.9}.remote-title{display:flex;align-items:center;gap:12px}.ir-quick-grid{grid-template-columns:repeat(auto-fill,minmax(115px,1fr))}.ir-quick-grid .ir-send-form button{color:var(--fg);min-height:44px;overflow-wrap:anywhere}.ir-command-tools h3{font-size:13px;color:var(--muted);font-weight:600}.command-code{font-size:11px}.wizard-top .pill{display:none}.wizard-grid{grid-template-columns:minmax(0,1fr)}.stepper{display:flex;gap:4px;border:0;border-bottom:1px solid var(--line);padding:0 0 10px}.step{flex:1;min-width:0;display:block;padding:10px 8px;text-align:center}.step>span,.step .subtle{display:none}.wizard-body{padding:18px 0}.setup-shell{display:none}.setup-shell.open{display:block}.setup-shell .subtle{display:none}.ir-command-row{grid-template-columns:minmax(0,1fr) auto}.ir-command-row>.command-editor{grid-column:1/-1}.device-management{margin-top:12px}.device-management>summary{font-size:14px}.ir-quick-grid .hidden{display:none!important}"
+        "@media(max-width:1060px){.ir-stored-layout{grid-template-columns:minmax(0,1fr)}.ir-device-picks{display:flex;flex-wrap:wrap}.ir-device-pick{min-width:150px}.ir-control-layout{grid-template-columns:minmax(240px,310px) minmax(0,1fr)}}"
+        "@media(max-width:760px){header{position:static;padding:14px 16px}.topbar{flex-direction:row;align-items:center}.brand h1{font-size:17px}.top-status .pill:first-child{display:none}.top-status .pill{font-size:10px}.app-shell{display:block;padding:0 16px 24px}.side-menu{position:relative;top:auto;display:flex;align-items:center;gap:2px;padding:8px 0 12px;overflow:visible;border-bottom:1px solid var(--line);margin-bottom:16px}.side-menu>.menu-item{min-width:0;flex:1;display:flex;flex-direction:column;gap:5px;padding:8px 4px}.menu-item strong{font-size:11px}.nav-more{margin:0;align-self:stretch;position:relative}.nav-more>summary{height:100%;display:grid;place-content:center;list-style:none;padding:8px;font-size:11px}.nav-more[open]{z-index:4}.nav-more[open] .more-menu{position:absolute;top:100%;right:0;width:210px;background:white;border:1px solid var(--line);padding:8px;box-shadow:0 8px 20px #0002;border-radius:6px}.more-menu .menu-item{display:flex;gap:12px}.ir-control-layout{grid-template-columns:minmax(0,1fr)}.remote-pad{margin:0 auto}.ir-work-head{flex-direction:row;align-items:center}.ir-work-head .actions{gap:5px}.ir-work-head .actions button{width:auto;font-size:12px}.ir-work-head h3{font-size:20px}.ir-quick-grid{grid-template-columns:repeat(auto-fill,minmax(115px,1fr))}.stepper{display:flex;overflow:auto}.step{font-size:12px}.ir-command-row{grid-template-columns:minmax(0,1fr)}.section.active{gap:12px}}"
+        ".remote-pad .power-key button{color:#a52a35;background:#fff2f3;border-color:#f2d3d6}.remote-colors .red button{background:#bf3d46}.remote-colors .green button{background:#27805c}.remote-colors .yellow button{background:#daa728}.remote-colors .blue button{background:#347bb7}.ir-command-tools .ir-quick-grid{max-height:440px;overflow:auto;padding:1px}.remote-colors button:focus-visible{outline-color:#232629}.brand-mark{background:#303b40}"
+        ".ir-send-form button{touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}"
         "</style></head><body>",
         f);
-    fprintf(f,
-        "<header><div class='topbar'><div class='brand'><div class='brand-mark'>H</div><div><h1>Harmony Hub Control</h1><small>Local smart home console</small></div></div><div class='top-status'><span class='pill'>Local control</span><span class='pill %s'>Logitech cloud %s</span></div></div></header><main class='app-shell'><aside class='side-menu' aria-label='Main menu'><button type='button' class='menu-item active' data-view-target='overview'><span>D</span><div><strong>Dashboard</strong><small>Status</small></div></button><button type='button' class='menu-item' data-view-target='control'><span>R</span><div><strong>Control</strong><small>Send buttons</small></div></button><button type='button' class='menu-item' data-view-target='ir'><span>IR</span><div><strong>IR Setup</strong><small>Add remotes</small></div></button><button type='button' class='menu-item' data-view-target='lab'><span>L</span><div><strong>Bulk IR Test</strong><small>Queue IR codes</small></div></button><button type='button' class='menu-item' data-view-target='bluetooth'><span>BT</span><div><strong>Bluetooth</strong><small>Keyboard</small></div></button><button type='button' class='menu-item' data-view-target='mqtt'><span>M</span><div><strong>MQTT</strong><small>Home Assistant</small></div></button><button type='button' class='menu-item' data-view-target='wifi'><span>W</span><div><strong>Wi-Fi</strong><small>Network</small></div></button><button type='button' class='menu-item' data-view-target='backup'><span>B</span><div><strong>Backup</strong><small>Import/export</small></div></button><button type='button' class='menu-item' data-view-target='system'><span>S</span><div><strong>System</strong><small>Logs/update</small></div></button></aside><div class='content'>",
-        cloud_blocked ? "ok" : "warn",
-        cloud_blocked ? "blocked" : "allowed");
+    fputs("<svg style='position:absolute;width:0;height:0' aria-hidden='true'>", f);
+    fputs(LUCIDE_SYMBOLS, f);
+    fputs("</svg><header><div class='topbar'><div class='brand'><div class='brand-mark'>H</div><h1>Harmony Hub</h1></div>", f);
+    fprintf(f, "<div class='top-status'><span class='pill'>Local control</span><span class='pill %s'>Cloud %s</span></div></div></header><main class='app-shell'><nav class='side-menu' aria-label='Main menu'>", cloud_blocked ? "ok" : "warn", cloud_blocked ? "blocked" : "connected");
+    nav_button(f, "control", "Remote", "Tv");
+    nav_button(f, "ir", "Devices", "SlidersHorizontal");
+    nav_button(f, "bluetooth", "Bluetooth", "Bluetooth");
+    fputs("<details class='nav-more'><summary>More</summary><div class='more-menu'>", f);
+    nav_button(f, "overview", "Hub status", "Radio");
+    nav_button(f, "mqtt", "Home Assistant", "House");
+    nav_button(f, "wifi", "Wi-Fi", "Wifi");
+    nav_button(f, "backup", "Backup", "Archive");
+    nav_button(f, "system", "Settings", "Settings");
+    nav_button(f, "lab", "Bulk IR test", "List");
+    fputs("</div></details></nav><div class='content'>", f);
 }
 
 static void page_end(FILE *f) {
@@ -2910,19 +3042,18 @@ static void page_end(FILE *f) {
         "const $=id=>document.getElementById(id);"
         "if('scrollRestoration' in history)history.scrollRestoration='manual';"
         "document.querySelectorAll('[data-remote-skin]').forEach(img=>{img.src=REMOTE_SKIN_SRC;});"
-        "function showView(name){let panel='';if(name&&name.startsWith('ir-')){panel=name.slice(3);name='ir';}if(!name)name='overview';let found=false;document.querySelectorAll('[data-view]').forEach(s=>{const on=s.dataset.view===name;s.classList.toggle('active',on);if(on)found=true;});if(!found&&name!=='overview'){showView('overview');return;}document.querySelectorAll('[data-view-target]').forEach(b=>b.classList.toggle('active',b.dataset.viewTarget===name));if(location.hash!=='#'+name)history.replaceState(null,'','#'+name);if(name==='ir'&&panel)setTimeout(()=>showWizardPanel(panel),0);window.scrollTo(0,0);setTimeout(()=>window.scrollTo(0,0),0);}"
-        "document.querySelectorAll('[data-view-target]').forEach(b=>b.addEventListener('click',()=>showView(b.dataset.viewTarget)));"
-        "showView((location.hash||'#overview').slice(1));"
+        "function showView(name){let panel='';if(name&&name.startsWith('ir-')){panel=name.slice(3);name='ir';}if(!name)name='control';let found=false;document.querySelectorAll('[data-view]').forEach(s=>{const on=s.dataset.view===name;s.classList.toggle('active',on);if(on)found=true;});if(!found&&name!=='control'){showView('control');return;}document.querySelectorAll('[data-view-target]').forEach(b=>{const active=b.dataset.viewTarget===name;b.classList.toggle('active',active);if(active)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});document.querySelector('.nav-more')?.removeAttribute('open');if(location.hash!=='#'+name)history.replaceState(null,'','#'+name);if(name==='ir'&&panel)setTimeout(()=>showWizardPanel(panel),0);window.scrollTo(0,0);}"
+        "document.addEventListener('click',e=>{const b=e.target.closest('[data-view-target]');if(b)showView(b.dataset.viewTarget);});"
+        "showView((location.hash||'#control').slice(1));window.addEventListener('hashchange',()=>showView(location.hash.slice(1)));"
         "const importFile=$('importFile');if(importFile){importFile.addEventListener('change',()=>{const file=importFile.files&&importFile.files[0];if(!file)return;const reader=new FileReader();reader.onload=()=>{const box=document.querySelector('textarea[name=payload]');if(box)box.value=reader.result||''};reader.readAsText(file);});}"
         "const cap=$('captureNow');if(cap){cap.addEventListener('click',async()=>{const s=$('captureStatus'),raw=$('captureRaw');try{s.textContent='capturing...';const r=await fetch('/api/capture',{method:'POST'});const j=await r.json();raw.value=j.raw||'';s.textContent=j.raw?'capture received':'no capture payload';}catch(e){s.textContent='capture failed';}});}"
         "let wizardInventory=null;"
         "function plainText(html){return String(html||'').replace(/<script[\\s\\S]*?<\\/script>/gi,'').replace(/<style[\\s\\S]*?<\\/style>/gi,'').replace(/<[^>]+>/g,' ').replace(/\\s+/g,' ').trim();}"
         "function escHtml(s){return String(s||'').replace(/[&<>\"']/g,c=>c==='&'?'&amp;':c==='<'?'&lt;':c==='>'?'&gt;':c==='\"'?'&quot;':'&#39;');}"
         "function wizStatus(id,t){const el=$(id);if(el)el.textContent=t||'';}"
-        "function showWizardPanel(name){document.querySelectorAll('.wizard-panel').forEach(p=>p.classList.toggle('active',p.dataset.panel===name));document.querySelectorAll('.step').forEach(b=>b.classList.toggle('active',b.dataset.stepTarget===name));if(name==='library')syncProfileToSearch(false);}"
+        "function showWizardPanel(name){document.querySelector('.setup-shell')?.classList.add('open');document.querySelectorAll('.wizard-panel').forEach(p=>p.classList.toggle('active',p.dataset.panel===name));document.querySelectorAll('.step').forEach(b=>b.classList.toggle('active',b.dataset.stepTarget===name));if(name==='library')syncProfileToSearch(false);}"
         "document.querySelectorAll('[data-step-target]').forEach(b=>b.addEventListener('click',()=>showWizardPanel(b.dataset.stepTarget)));"
-        "function framePost(path,data){return new Promise((resolve,reject)=>{const frame=document.createElement('iframe'),form=document.createElement('form'),name='wizFrame'+Date.now();let done=false,submitted=false;frame.name=name;frame.style.display='none';form.method='post';form.action=path;form.target=name;form.style.display='none';Object.keys(data||{}).forEach(k=>{const i=document.createElement('input');i.type='hidden';i.name=k;i.value=data[k]||'';form.append(i);});function finish(ok,text){if(done)return;done=true;clearTimeout(timer);setTimeout(()=>{frame.remove();form.remove();},200);resolve({ok:ok,text:text||''});}const timer=setTimeout(()=>finish(false,'timeout'),30000);frame.onload=()=>{let text='',href='';try{href=frame.contentWindow.location.href||'';if(!submitted||href==='about:blank')return;const d=frame.contentDocument;text=(d.body&&(d.body.innerText||d.body.textContent))||d.documentElement.textContent||'';}catch(e){text='';}finish(true,text);};document.body.append(frame,form);submitted=true;form.submit();});}"
-        "async function postForm(path,data){return await framePost(path,data);}"
+        "async function postForm(path,data){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(data||{})});let text=await r.text();if(!r.ok)throw new Error('Request failed ('+r.status+').');if(text.includes('<!doctype')){const doc=new DOMParser().parseFromString(text,'text/html');const old=document.querySelector('[data-view=control]'),fresh=doc.querySelector('[data-view=control]');if(old&&fresh){fresh.classList.toggle('active',old.classList.contains('active'));old.replaceWith(fresh);fresh.querySelectorAll('[data-remote-skin]').forEach(img=>img.src=REMOTE_SKIN_SRC);}const editor=document.querySelector('#view-ir .ir-stored-layout'),updated=doc.querySelector('#view-ir .ir-stored-layout');if(updated){if(editor)editor.replaceWith(updated);else document.querySelector('#view-ir')?.append(updated);}const id=data?.deviceId||sessionStorage.getItem('remoteDevice');if(id)showIrStoredDevice(id);text=doc.querySelector('.msg')?.textContent||'Saved.';}return{ok:true,text};}"
         "function keyProtocol(k){return /MemorexO1/i.test(k||'')?'679':'2';}"
         "function extractKeycode(t){const m=String(t||'').match(/G:[^\\r\\n\"'<>]+?:\\d+/);return m?m[0].replace(/,$/,'').trim():'';}"
         "function extractNecHex(t){t=String(t||'').trim();let m=t.match(/^0x([0-9a-f]{1,8})$/i)||t.match(/^([0-9a-f]{1,8})$/i);if(m)return m[1].toUpperCase();m=t.match(/0x([0-9a-f]{8})(?![0-9a-f])/i);if(m)return m[1].toUpperCase();if(/nec|samsung|toshiba|memorex|protocol|keycode/i.test(t)){m=t.match(/(^|[^0-9a-f])([0-9a-f]{8})(?![0-9a-f])/i);if(m)return m[2].toUpperCase();}return '';}"
@@ -2938,9 +3069,9 @@ static void page_end(FILE *f) {
         "function profileQuery(){const d=profileData();return(d.manufacturer&&d.model)?d.manufacturer+' '+d.model:(d.name||d.model||d.manufacturer);}"
         "function syncProfileToSearch(force){const q=profileQuery(),s=$('irdbSearch'),pre=$('irdbPrefix');if(s&&q&&(force||!s.value.trim()))s.value=q;if(pre&&!pre.value.trim())pre.value='';}"
         "function findProfileDeviceId(d){const list=(wizardInventory&&wizardInventory.devices)||[],same=x=>String(x||'').trim().toLowerCase();let dev=list.find(x=>same(x.name)===same(d.name)&&same(x.manufacturer)===same(d.manufacturer)&&same(x.model)===same(d.model));if(!dev)dev=list.find(x=>same(x.manufacturer)===same(d.manufacturer)&&same(x.model)===same(d.model));return dev&&dev.id?dev.id:'';}"
-        "function selectDeviceEverywhere(id,name){if(!id)return;['wizardDevice','verifyDevice','irdbDevice','labDevice'].forEach(selId=>{const s=$(selId);if(!s)return;if(!Array.from(s.options).some(o=>o.value===id)){const o=document.createElement('option');o.value=id;o.textContent=(name||'Device')+' ('+id+')';s.append(o);}s.value=id;});populateVerifyCommands();}"
-        "function openIrSetup(panel,id){if(id)selectDeviceEverywhere(id);showView('ir-'+(panel||'device'));setTimeout(()=>{if(id)selectDeviceEverywhere(id);document.querySelector('.setup-shell')?.scrollIntoView({behavior:'smooth',block:'start'});},0);}"
-        "document.querySelectorAll('[data-next-step]').forEach(b=>b.addEventListener('click',()=>{const p=b.closest('[data-ir-device]');openIrSetup(b.dataset.nextStep,p&&p.dataset.irDevice);}));"
+        "function selectDeviceEverywhere(id,name){if(!id)return;['wizardDevice','verifyDevice','irdbDevice','labDevice'].forEach(selId=>{const s=$(selId);if(!s)return;if(!Array.from(s.options).some(o=>o.value===id)){const o=document.createElement('option');o.value=id;o.textContent=name||'Device';s.append(o);}s.value=id;});populateVerifyCommands();}"
+        "function openIrSetup(panel,id){if(id){selectDeviceEverywhere(id);const dev=wizardInventory?.devices?.find(d=>d.id===id);if(dev&&panel==='library')$('irdbSearch').value=[dev.manufacturer,dev.model].filter(Boolean).join(' ');}showView('ir-'+(panel||'device'));setTimeout(()=>{if(id)selectDeviceEverywhere(id);document.querySelector('.setup-shell')?.scrollIntoView({behavior:'smooth',block:'start'});},0);}"
+        "document.addEventListener('click',e=>{const b=e.target.closest('[data-next-step]');if(b){const p=b.closest('[data-ir-device]');openIrSetup(b.dataset.nextStep,p&&p.dataset.irDevice);}});"
         "const wizDevice=$('wizardDevice');if(wizDevice)wizDevice.addEventListener('change',()=>{syncWizardDevice('wizardDevice','verifyDevice');const imp=$('irdbDevice');if(imp)imp.value=wizDevice.value;});"
         "const verDevice=$('verifyDevice');if(verDevice)verDevice.addEventListener('change',populateVerifyCommands);"
         "const wizName=$('wizardCommandName');if(wizName)wizName.addEventListener('input',populateVerifyCommands);"
@@ -2950,16 +3081,90 @@ static void page_end(FILE *f) {
         "const wizCap=$('wizardCapture');if(wizCap){wizCap.addEventListener('click',async()=>{try{wizStatus('wizardLearnStatus','listening...');const r=await postForm('/api/capture',{});let txt=(r.text||'').trim(),j={};try{j=JSON.parse(txt);}catch(e){j={raw:txt};}if(!applyCaptureAnalysis(j,j.raw||txt))wizStatus('wizardLearnStatus','no signal received');}catch(e){wizStatus('wizardLearnStatus','capture failed');}});}"
         "function learnFormData(){return{deviceId:selectedDeviceId('wizardDevice'),name:($('wizardCommandName')?.value||'').trim(),mode:$('wizardMode')?.value||'raw',protocol:$('wizardProtocol')?.value||'2',nec:$('wizardNec')?.value||'',keycode:$('wizardKeycode')?.value||'',raw:$('wizardRaw')?.value||''};}"
         "function learnHasSignal(d){return!!((d.keycode||'').trim()||(d.nec||'').trim()||(d.raw||'').trim());}"
-        "const wizLearnTest=$('wizardLearnTest');if(wizLearnTest){wizLearnTest.addEventListener('click',async()=>{const data=learnFormData();if(!data.deviceId){wizStatus('wizardLearnStatus','choose a device before testing');return;}if(!learnHasSignal(data)){wizStatus('wizardLearnStatus','learn or enter a signal before testing');return;}try{wizStatus('wizardLearnStatus','testing learned signal...');const j=await postJson('/api/ir-test-learned',data);const tail=String(j.reply||'').trim();wizStatus('wizardLearnStatus','test sent'+(tail?': '+tail.slice(0,180):''));await loadWizardInventory();}catch(e){wizStatus('wizardLearnStatus','test failed: '+(e.message||e));}});}"
+        "const wizLearnTest=$('wizardLearnTest');if(wizLearnTest){wizLearnTest.addEventListener('click',async()=>{const data=learnFormData();if(!data.deviceId){wizStatus('wizardLearnStatus','Choose a device before testing.');return;}if(!learnHasSignal(data)){wizStatus('wizardLearnStatus','Capture or enter a signal before testing.');return;}wizLearnTest.disabled=true;try{wizStatus('wizardLearnStatus','Sending captured signal...');await postJson('/api/ir-test-learned',data);wizStatus('wizardLearnStatus','Hub accepted the test command.');await loadWizardInventory();}catch(e){wizStatus('wizardLearnStatus','Test failed: '+(e.message||e));}finally{wizLearnTest.disabled=false;}});}"
         "const wizForm=$('wizardLearnForm');if(wizForm){wizForm.addEventListener('submit',async e=>{e.preventDefault();const data=learnFormData();try{wizStatus('wizardLearnStatus','saving...');const res=await postForm('/ir/command',data);const msg=plainText(res.text);wizStatus('wizardLearnStatus',msg.includes('Saved command')?'command saved. You can learn another signal or open Verify.':(msg||'save request complete'));await loadWizardInventory();const vd=$('verifyDevice');if(vd)vd.value=data.deviceId;populateVerifyCommands();}catch(err){wizStatus('wizardLearnStatus','save failed');}});}"
-        "const wizTest=$('wizardTest');if(wizTest){wizTest.addEventListener('click',async()=>{const data={deviceId:selectedDeviceId('verifyDevice')||selectedDeviceId('wizardDevice'),command:$('verifyCommand')?.value||($('wizardCommandName')?.value||'')};if(!data.deviceId||!data.command){wizStatus('wizardVerifyStatus','choose a command');return;}try{wizStatus('wizardVerifyStatus','sending...');const res=await postForm('/ir/send',data);const msg=plainText(res.text);wizStatus('wizardVerifyStatus',msg||'test sent');}catch(e){wizStatus('wizardVerifyStatus','test failed');}});}"
+        "const wizTest=$('wizardTest');if(wizTest){wizTest.addEventListener('click',async()=>{const data={deviceId:selectedDeviceId('verifyDevice')||selectedDeviceId('wizardDevice'),command:$('verifyCommand')?.value||''};if(!data.deviceId||!data.command){wizStatus('wizardVerifyStatus','Choose a command.');return;}wizTest.disabled=true;try{wizStatus('wizardVerifyStatus','Sending...');await postJson('/api/ir-send',data);wizStatus('wizardVerifyStatus','Hub accepted '+data.command+'.');}catch(e){wizStatus('wizardVerifyStatus','Send failed: '+(e.message||e));}finally{wizTest.disabled=false;}});}"
         "loadWizardInventory();"
-        "function irStatus(deviceId,msg){document.querySelectorAll('[data-ir-status]').forEach(el=>{if(el.dataset.irStatus===deviceId)el.textContent=msg;});}"
-        "function showIrStoredDevice(id){if(!id)return;document.querySelectorAll('[data-ir-device-pick]').forEach(b=>b.classList.toggle('active',b.dataset.irDevicePick===id));document.querySelectorAll('[data-ir-device]').forEach(p=>p.classList.toggle('active',p.dataset.irDevice===id));selectDeviceEverywhere(id);irStatus(id,'Ready.');}"
-        "document.querySelectorAll('[data-ir-device-pick]').forEach(b=>b.addEventListener('click',()=>showIrStoredDevice(b.dataset.irDevicePick)));"
+        "function irStatus(deviceId,msg,state=''){document.querySelectorAll('[data-ir-status]').forEach(el=>{if(el.dataset.irStatus===deviceId){el.textContent=msg;el.dataset.state=state;}});}"
+        "function showIrStoredDevice(id){if(!id||!Array.from(document.querySelectorAll('[data-ir-device]')).some(p=>p.dataset.irDevice===id))return;sessionStorage.setItem('remoteDevice',id);document.querySelectorAll('[data-ir-device-pick]').forEach(b=>{const on=b.dataset.irDevicePick===id;b.classList.toggle('active',on);b.setAttribute('aria-pressed',String(on));});document.querySelectorAll('[data-ir-device]').forEach(p=>p.classList.toggle('active',p.dataset.irDevice===id));selectDeviceEverywhere(id);irStatus(id,'Ready.');}"
+        "showIrStoredDevice(sessionStorage.getItem('remoteDevice'));document.addEventListener('click',e=>{const b=e.target.closest('[data-ir-device-pick]');if(b)showIrStoredDevice(b.dataset.irDevicePick);});"
         "function irFormData(form){const data={};new FormData(form).forEach((v,k)=>data[k]=v);return data;}"
-        "document.querySelectorAll('.ir-send-form').forEach(form=>form.addEventListener('submit',async e=>{e.preventDefault();const data=irFormData(form),btn=form.querySelector('button')||form;if(!data.deviceId||!data.command)return;try{btn.classList.add('sending');form.classList.add('sending');irStatus(data.deviceId,'Sending '+data.command+'...');const j=await postJson('/api/ir-send',data);irStatus(data.deviceId,'Sent '+data.command+(j.reply?': '+String(j.reply).slice(0,140):''));}catch(err){irStatus(data.deviceId,'Send failed: '+(err.message||err));}finally{setTimeout(()=>{btn.classList.remove('sending');form.classList.remove('sending');},220);}}));"
-        "document.querySelectorAll('.ir-command-filter').forEach(input=>input.addEventListener('input',()=>{const id=input.dataset.commandFilter,q=normText(input.value||'');document.querySelectorAll('[data-command-list=\"'+id+'\"]').forEach(list=>Array.from(list.children).forEach(row=>{const t=normText(row.textContent||row.dataset.commandName||'');row.classList.toggle('hidden',!!q&&!t.includes(q));}));}));"
+        "function installIrHoldControls(){\n"
+        "  let active=null;\n"
+        "  async function tap(form){\n"
+        "    if(active)return;\n"
+        "    const data=irFormData(form),button=form.querySelector('button');\n"
+        "    if(!data.deviceId||!data.command||button.disabled)return;\n"
+        "    const state={button,data,tap:true};active=state;\n"
+        "    button.classList.add('sending');button.disabled=true;\n"
+        "    try{irStatus(data.deviceId,'Sending '+data.command+'...');await postJson('/api/ir-send',data);irStatus(data.deviceId,'Hub accepted '+data.command+'.','success');}\n"
+        "    catch(e){irStatus(data.deviceId,'Send failed: '+e.message,'error');}\n"
+        "    finally{button.disabled=false;button.classList.remove('sending');if(active===state)active=null;}\n"
+        "  }\n"
+        "  function clear(state){\n"
+        "    clearTimeout(state.timer);clearTimeout(state.beat);\n"
+        "    state.button.classList.remove('sending');state.button.setAttribute('aria-pressed','false');\n"
+        "    if(active===state)active=null;\n"
+        "  }\n"
+        "  function cancel(state){\n"
+        "    return fetch('/api/ir-cancel',{method:'POST',body:new URLSearchParams({runId:state.run}),keepalive:true}).catch(()=>{});\n"
+        "  }\n"
+        "  function stop(allowTap=false){\n"
+        "    const state=active;\n"
+        "    if(!state||state.tap||state.stopped)return;\n"
+        "    state.stopped=true;clearTimeout(state.timer);clearTimeout(state.beat);\n"
+        "    if(state.holding){cancel(state);irStatus(state.data.deviceId,'Releasing '+state.data.command+'...');}\n"
+        "    else{clear(state);if(allowTap)tap(state.form);}\n"
+        "  }\n"
+        "  async function renew(state){\n"
+        "    if(state.stopped||active!==state)return;\n"
+        "    try{await postJson('/api/ir-hold',{phase:'keepalive',runId:state.run});}\n"
+        "    catch(e){stop();irStatus(state.data.deviceId,'Hold stopped: '+e.message,'error');return;}\n"
+        "    if(!state.stopped&&active===state)state.beat=setTimeout(()=>renew(state),250);\n"
+        "  }\n"
+        "  async function hold(state){\n"
+        "    if(state.stopped||active!==state)return;\n"
+        "    state.holding=true;state.button.classList.add('sending');state.button.setAttribute('aria-pressed','true');\n"
+        "    irStatus(state.data.deviceId,'Holding '+state.data.command+'...');\n"
+        "    state.beat=setTimeout(()=>renew(state),250);\n"
+        "    try{await postJson('/api/ir-hold',{...state.data,phase:'start',runId:state.run});irStatus(state.data.deviceId,'Released '+state.data.command+'.');}\n"
+        "    catch(e){cancel(state);irStatus(state.data.deviceId,'Hold failed: '+e.message,'error');}\n"
+        "    finally{state.stopped=true;clear(state);}\n"
+        "  }\n"
+        "  function begin(button,pointer,key){\n"
+        "    if(active||!button||button.disabled)return;\n"
+        "    const form=button.closest('.ir-send-form');if(!form)return;\n"
+        "    const data=irFormData(form);if(!data.deviceId||!data.command)return;\n"
+        "    const bytes=new Uint32Array(4);crypto.getRandomValues(bytes);\n"
+        "    const state={form,button,data,pointer,key,run:'hold-'+Array.from(bytes,x=>x.toString(16)).join('-'),stopped:false,holding:false};\n"
+        "    active=state;state.timer=setTimeout(()=>hold(state),300);return state;\n"
+        "  }\n"
+        "  document.addEventListener('pointerdown',e=>{\n"
+        "    const button=e.target.closest('.ir-send-form button');if(!button||e.button!==0||e.isPrimary===false)return;\n"
+        "    e.preventDefault();button.focus();\n"
+        "    if(begin(button,e.pointerId,null))button.setPointerCapture(e.pointerId);\n"
+        "  });\n"
+        "  document.addEventListener('pointerup',e=>{if(active?.pointer===e.pointerId)stop(true);});\n"
+        "  document.addEventListener('pointermove',e=>{\n"
+        "    if(active?.pointer!==e.pointerId)return;\n"
+        "    const r=active.button.getBoundingClientRect();\n"
+        "    if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)stop();\n"
+        "  });\n"
+        "  ['pointercancel','lostpointercapture'].forEach(name=>document.addEventListener(name,e=>{if(active?.pointer===e.pointerId)stop();}));\n"
+        "  document.addEventListener('keydown',e=>{\n"
+        "    if(e.key!==' '&&e.key!=='Enter')return;\n"
+        "    const button=e.target.closest('.ir-send-form button');if(!button)return;\n"
+        "    e.preventDefault();if(!e.repeat)begin(button,null,e.key);\n"
+        "  });\n"
+        "  document.addEventListener('keyup',e=>{if(active?.key===e.key){e.preventDefault();stop(true);}});\n"
+        "  document.addEventListener('submit',e=>{if(e.target.matches('.ir-send-form')){e.preventDefault();tap(e.target);}});\n"
+        "  document.addEventListener('click',e=>{if(e.detail>0&&e.target.closest('.ir-send-form button'))e.preventDefault();if(e.target.closest('[data-view-target],[data-ir-device-pick],[data-next-step]'))stop();});\n"
+        "  document.addEventListener('contextmenu',e=>{if(e.target.closest('.ir-send-form button'))e.preventDefault();});\n"
+        "  document.addEventListener('visibilitychange',()=>{if(document.hidden)stop();});\n"
+        "  ['blur','pagehide','hashchange'].forEach(name=>window.addEventListener(name,()=>stop()));\n"
+        "}\n"
+        "installIrHoldControls();\n"
+        "document.addEventListener('input',e=>{const input=e.target;if(!input.matches('.ir-command-filter'))return;const id=input.dataset.commandFilter,q=normText(input.value||'');document.querySelectorAll('[data-command-list=\"'+id+'\"]').forEach(list=>Array.from(list.children).forEach(row=>{const t=normText(row.textContent||row.dataset.commandName||'');row.classList.toggle('hidden',!!q&&!t.includes(q));}));});"
         "const IRDB_BASE='https://cdn.jsdelivr.net/gh/probonopd/irdb@master/codes/';"
         "const FLIPPER_BASE='https://cdn.jsdelivr.net/gh/Lucaslhm/Flipper-IRDB@main/';"
         "const FLIPPER_INDEX='https://api.github.com/repos/Lucaslhm/Flipper-IRDB/git/trees/main?recursive=1';"
@@ -3178,7 +3383,7 @@ static void page_end(FILE *f) {
         "async function labClearLabTarget(dev){try{const j=await postJson('/api/ir-lab-clear',{deviceId:dev});labLog(j.message||'temporary device cleared');await labSleep(700);await loadWizardInventory();lab.queue.forEach(r=>{r.stored=false;});lab.imported=false;labRender();return true;}catch(e){labLog('temporary device clear failed: '+(e.message||e));return false;}}"
         "async function labCancelRun(){const id=lab.runId;if(!id)return;try{await postJson('/api/ir-cancel',{runId:id});labLog('cancel sent for '+id);}catch(e){labLog('cancel failed: '+(e.message||e));}}"
         "function labServerChunk(requested,delay){const maxHold=4000,byTime=Math.max(1,Math.floor(maxHold/Math.max(40,delay)));return Math.max(1,Math.min(requested,byTime,1024));}"
-        "async function labRunRows(rows,dev,dry,delay,requestedChunk,offset,total){const chunk=labServerChunk(requestedChunk,delay);let done=0;labLog('run '+lab.runId+' using hub chunk '+chunk+' (requested '+requestedChunk+')');for(let i=0;i<rows.length;i+=chunk){if(lab.stop){labStatus('stopped after '+(offset+done)+' commands');break;}const slice=rows.slice(i,i+chunk),label=(dry?'dry-running ':'sending ')+(i+1)+'-'+(i+slice.length)+' / '+rows.length;labStatus((total&&total>rows.length?('stream '+(offset+done)+' sent, '+label):label));const j=await postJson('/api/ir-batch-send',{deviceId:dev,commands:slice.map(r=>r.name).join('\\n'),delayMs:delay,dryRun:dry?'1':'0',runId:lab.runId});done+=j.sent||0;labMeter(total?Math.min(offset+done,total):done,total||rows.length);const failText=j.failed?(', '+j.failed+' failed'):'';labLog((dry?'dry run ':'batch sent ')+(j.sent||0)+' commands'+failText+' in '+(j.elapsedMs||0)+' ms; last '+String(j.lastReply||'').slice(0,120));if(j.canceled){lab.stop=true;labStatus('stopped after '+(offset+done)+' commands');break;}}return done;}"
+        "async function labRunRows(rows,dev,dry,delay,requestedChunk,offset,total){const chunk=labServerChunk(requestedChunk,delay);let done=0;labLog('run '+lab.runId+' using hub chunk '+chunk+' (requested '+requestedChunk+')');for(let i=0;i<rows.length;i+=chunk){if(lab.stop){labStatus('stopped after '+(offset+done)+' commands');break;}const slice=rows.slice(i,i+chunk),label=(dry?'checking ':'sending ')+(i+1)+'-'+(i+slice.length)+' / '+rows.length;labStatus(label);const j=await postJson('/api/ir-batch-send',{deviceId:dev,commands:slice.map(r=>r.name).join('\\n'),delayMs:delay,dryRun:dry?'1':'0',runId:lab.runId});const count=dry?(j.attempted||0):(j.sent||0);done+=count;labMeter(total?Math.min(offset+i+slice.length,total):i+slice.length,total||rows.length);const failText=j.failed?(', '+j.failed+' failed'):'';labLog((dry?'checked ':'hub accepted ')+count+' commands'+failText+' in '+(j.elapsedMs||0)+' ms; last '+String(j.lastReply||'').slice(0,120));if(j.canceled){lab.stop=true;labStatus('stopped after '+(offset+done)+' commands');break;}}return done;}"
         "async function labRunQueue(){if(lab.running)return;const rows=labSelected(),dry=$('labDryRun')?.checked,delay=labNum('labSendDelay',80,40,10000),requestedChunk=labNum('labBatchSize',100,1,1024);if(!rows.length){labStatus('select at least one command');return;}try{const dev=await labResolveDevice();if(!dry&&rows.some(r=>!r.stored))await labImportQueue(rows);lab.running=true;lab.stop=false;lab.runId='run_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8);const ready=dry?rows:rows.filter(r=>r.stored);const done=await labRunRows(ready,dev,dry,delay,requestedChunk,0,ready.length);if(!lab.stop)labStatus((dry?'dry run complete: ':'send complete: ')+done+' commands');labMeter(done,ready.length);}catch(e){labStatus('send failed: '+(e.message||e));}finally{lab.running=false;lab.runId='';}}"
         "function labSetFilter(text,msg){const e=$('labCommandFilter');if(e)e.value=text;lab.index=[];lab.cursor=0;lab.key='';labStatus(msg||'filter updated');}"
         "const labOff=$('labOffFilter');if(labOff)labOff.addEventListener('click',()=>labSetFilter('off, power off, poweroff, standby, shutdown','off-oriented filter loaded'));const labPower=$('labPowerFilter');if(labPower)labPower.addEventListener('click',()=>labSetFilter('power, toggle, on, off, standby','power filter loaded'));const labVol=$('labVolumeFilter');if(labVol)labVol.addEventListener('click',()=>labSetFilter('volume, mute, vol up, vol down','volume filter loaded'));const labInput=$('labInputFilter');if(labInput)labInput.addEventListener('click',()=>labSetFilter('input, hdmi, source, aux, optical, bluetooth','input filter loaded'));const labClearFilter=$('labClearFilter');if(labClearFilter)labClearFilter.addEventListener('click',()=>labSetFilter('','filter cleared'));"
@@ -3350,9 +3555,7 @@ static void ir_device_options(FILE *f, const struct ir_inventory *inv, const cha
         html(f, dev->id);
         fprintf(f, "'%s>", selected && strcmp(selected, dev->id) == 0 ? " selected" : "");
         html(f, dev->name[0] ? dev->name : dev->id);
-        fprintf(f, " (");
-        html(f, dev->id);
-        fprintf(f, ")</option>");
+        fprintf(f, "</option>");
     }
 }
 
@@ -3399,57 +3602,6 @@ static void ir_command_editor(FILE *f, const char *device_id, const struct ir_co
         edit ? "Save command changes" : "Add command");
 }
 
-struct ir_remote_button {
-    const char *label;
-    const char *aliases;
-    double x, y, w, h;
-};
-
-static const struct ir_remote_button IR_REMOTE_BUTTONS[] = {
-    {"Power off", "poweroff|power off|standby|shutdown|off|powertoggle|power toggle|power", 13.55, 0.45, 18.60, 3.35},
-    {"Music", "music|audio", 8.80, 6.85, 26.75, 5.10},
-    {"TV", "tv|television|watchtv|display", 35.50, 6.85, 27.10, 5.10},
-    {"Movie", "movie|video|media", 62.60, 6.85, 27.10, 5.10},
-    {"Rewind", "rewind|rev|skipback|previous track", 8.80, 14.90, 27.95, 5.25},
-    {"Play", "play", 41.45, 15.00, 16.25, 5.40},
-    {"Forward", "fastforward|forward|ffwd|next track|skipforward", 62.45, 14.85, 27.95, 5.30},
-    {"Record", "record|rec", 8.95, 21.80, 27.90, 5.35},
-    {"Pause", "pause", 41.45, 21.80, 16.25, 5.35},
-    {"Stop", "stop", 62.45, 21.80, 27.95, 5.35},
-    {"Red", "red", 9.30, 30.00, 18.60, 3.75},
-    {"Green", "green", 30.10, 30.00, 18.95, 3.75},
-    {"Yellow", "yellow", 51.80, 30.00, 18.15, 3.75},
-    {"Blue", "blue", 73.25, 30.00, 17.45, 3.75},
-    {"DVR", "dvr|recordings", 9.00, 36.95, 27.40, 5.05},
-    {"Guide", "guide|epg", 36.40, 36.95, 26.40, 5.05},
-    {"Info", "info|information|displayinfo|settings|setting|setup|option|options", 62.80, 36.95, 26.75, 5.05},
-    {"Exit", "exit|clear|cancel", 9.10, 45.45, 36.05, 4.95},
-    {"Menu", "menu|home", 53.95, 45.45, 35.70, 4.95},
-    {"Up", "up|directionup|arrowup|cursorup", 36.40, 49.85, 27.60, 6.30},
-    {"Left", "left|directionleft|arrowleft|cursorleft", 28.80, 54.70, 14.90, 12.10},
-    {"Right", "right|directionright|arrowright|cursorright", 56.30, 54.70, 14.90, 12.10},
-    {"Down", "down|directiondown|arrowdown|cursordown", 36.40, 64.55, 27.60, 6.20},
-    {"OK", "ok|select|enter", 40.10, 56.10, 19.80, 9.10},
-    {"Volume up", "volumeup|volup|vol up|vol_up|volume up", 9.30, 52.20, 19.30, 8.85},
-    {"Volume down", "volumedown|voldown|voldn|vol down|vol_down|vol_dn|volume down", 9.30, 61.05, 19.30, 9.05},
-    {"Channel up", "channelup|chup|chnext|ch_next|ch up|channel next|channelnext|pageup|pgup", 70.20, 52.20, 19.15, 8.85},
-    {"Channel down", "channeldown|chdown|chdn|chprev|ch_prev|ch down|ch_dn|channel prev|channel previous|channel down|channelprev|channeldn|pagedown|pgdown", 70.20, 61.05, 19.15, 9.05},
-    {"Mute", "mute", 9.30, 71.70, 36.20, 5.30},
-    {"Back", "back|return|previous", 54.15, 71.70, 35.55, 5.30},
-    {"1", "1|digit1|number1|num1", 9.30, 80.45, 27.10, 3.45},
-    {"2", "2|digit2|number2|num2", 36.40, 80.45, 26.25, 3.45},
-    {"3", "3|digit3|number3|num3", 62.60, 80.45, 27.05, 3.45},
-    {"4", "4|digit4|number4|num4", 9.30, 85.55, 27.10, 3.40},
-    {"5", "5|digit5|number5|num5", 36.40, 85.55, 26.25, 3.40},
-    {"6", "6|digit6|number6|num6", 62.60, 85.55, 27.05, 3.40},
-    {"7", "7|digit7|number7|num7", 9.30, 90.60, 27.10, 3.35},
-    {"8", "8|digit8|number8|num8", 36.40, 90.60, 26.25, 3.35},
-    {"9", "9|digit9|number9|num9", 62.60, 90.60, 27.05, 3.35},
-    {"Dash", "dash|hyphen|separator|dot|period|minus", 9.30, 95.70, 27.10, 3.35},
-    {"0", "0|digit0|number0|num0", 36.40, 95.70, 26.25, 3.35},
-    {"Enter", "enter|e", 62.60, 95.70, 27.05, 3.35}
-};
-
 static void ir_command_key(const char *s, char *out, size_t outlen) {
     size_t w = 0;
     if (!outlen) return;
@@ -3475,7 +3627,6 @@ static int ir_alias_match(const char *cmd_key, const char *aliases) {
         alias[n] = 0;
         ir_command_key(alias, alias_key, sizeof(alias_key));
         if (alias_key[0] && strcmp(cmd_key, alias_key) == 0) return 1;
-        if (strlen(alias_key) > 4 && strstr(cmd_key, alias_key) != NULL) return 1;
     }
     return 0;
 }
@@ -3488,16 +3639,6 @@ static const struct ir_command *ir_find_remote_command(const struct ir_device *d
         if (ir_alias_match(key, aliases)) return &dev->commands[i];
     }
     return NULL;
-}
-
-static int ir_command_has_remote_button(const struct ir_command *cmd) {
-    size_t i;
-    char key[160];
-    ir_command_key(cmd->name, key, sizeof(key));
-    for (i = 0; i < sizeof(IR_REMOTE_BUTTONS) / sizeof(IR_REMOTE_BUTTONS[0]); i++) {
-        if (ir_alias_match(key, IR_REMOTE_BUTTONS[i].aliases)) return 1;
-    }
-    return 0;
 }
 
 static void ir_send_hidden_inputs(FILE *f, const char *device_id, const char *command) {
@@ -3516,89 +3657,81 @@ static void ir_quick_send_button(FILE *f, const struct ir_device *dev, const str
     fprintf(f, "</button></form>");
 }
 
-static void ir_remote_hotspot(FILE *f, const struct ir_device *dev, const struct ir_remote_button *button) {
-    const struct ir_command *cmd = ir_find_remote_command(dev, button->aliases);
-    if (cmd) {
-        fprintf(f, "<form class='ir-send-form remote-hotspot' method='post' action='/ir/send#ir' data-label='");
-        html(f, button->label);
-        fprintf(f, "' title='Send ");
-        html(f, cmd->name);
-        fprintf(f, "' style='left:%.2f%%;top:%.2f%%;width:%.2f%%;height:%.2f%%'>",
-            button->x, button->y, button->w, button->h);
-        ir_send_hidden_inputs(f, dev->id, cmd->name);
-        fprintf(f, "<button type='submit'><span class='sr-only'>Send ");
-        html(f, cmd->name);
-        fprintf(f, "</span></button></form>");
-    } else {
-        fprintf(f, "<span class='remote-hotspot disabled' title='No saved command for ");
-        html(f, button->label);
-        fprintf(f, "' style='left:%.2f%%;top:%.2f%%;width:%.2f%%;height:%.2f%%'></span>",
-            button->x, button->y, button->w, button->h);
-    }
+static void ir_remote_key(FILE *f, const struct ir_device *dev, const char *label, const char *aliases, const char *symbol, const char *cls) {
+    const struct ir_command *cmd = ir_find_remote_command(dev, aliases);
+    fprintf(f, "<form class='ir-send-form %s' method='post' action='/ir/send#control'>", cls);
+    if (cmd) ir_send_hidden_inputs(f, dev->id, cmd->name);
+    fprintf(f, "<button type='submit' title='");
+    html(f, cmd ? cmd->name : label);
+    if (!cmd) fputs(" (not saved)", f);
+    fprintf(f, "' aria-label='"); html(f, label);
+    fprintf(f, "'%s>", cmd ? "" : " disabled");
+    if (symbol[0]) icon(f, symbol);
+    else if (strcmp(cls, "red") == 0 || strcmp(cls, "green") == 0 || strcmp(cls, "yellow") == 0 || strcmp(cls, "blue") == 0) {
+        fputs("<span class='sr-only'>", f); html(f, label); fputs("</span>", f);
+    } else html(f, label);
+    fputs("</button></form>", f);
 }
 
-static void ir_render_unmapped_commands(FILE *f, const struct ir_device *dev) {
-    int i, mapped = 0, unmapped = 0;
-    for (i = 0; i < dev->command_count; i++) {
-        if (ir_command_has_remote_button(&dev->commands[i])) mapped++;
-        else unmapped++;
-    }
-    fprintf(f, "<div class='ir-unmapped'><div class='muted mini'>Remote photo maps %d of %d saved commands.</div>", mapped, dev->command_count);
-    if (unmapped > 0) {
-        fprintf(f, "<h3>Other saved buttons</h3><div class='help'>Send buttons not shown on the photo.</div><div class='ir-quick-grid'>");
-        for (i = 0; i < dev->command_count; i++) {
-            if (!ir_command_has_remote_button(&dev->commands[i])) {
-                ir_quick_send_button(f, dev, &dev->commands[i]);
-            }
-        }
-        fprintf(f, "</div>");
-    } else if (dev->command_count > 0) {
-        fprintf(f, "<div class='help'>Every saved command has a matching button on this remote skin.</div>");
-    }
-    fprintf(f, "</div>");
-}
-
-static void ir_render_remote_skin(FILE *f, const struct ir_device *dev) {
-    size_t i;
-    fprintf(f, "<div class='ir-remote-card'><h3>Remote control</h3><div class='ir-remote-shell'><div class='ir-remote-skin'><img data-remote-skin alt='Harmony remote control layout'>");
-    for (i = 0; i < sizeof(IR_REMOTE_BUTTONS) / sizeof(IR_REMOTE_BUTTONS[0]); i++) {
-        ir_remote_hotspot(f, dev, &IR_REMOTE_BUTTONS[i]);
-    }
-    fprintf(f, "</div></div><div class='help'>Tap highlights to send buttons.</div>");
-    ir_render_unmapped_commands(f, dev);
-    fprintf(f, "</div>");
+static void ir_render_remote(FILE *f, const struct ir_device *dev) {
+    fputs("<div class='remote-pad' aria-label='Remote buttons'><div class='remote-row'>", f);
+    ir_remote_key(f, dev, "Power", "power|powertoggle|onoff", "Power", "power-key");
+    ir_remote_key(f, dev, "Input", "input|source|inputnext", "LogIn", "");
+    ir_remote_key(f, dev, "Home", "home|menu", "House", "");
+    fputs("</div><div class='remote-middle'><div class='remote-rocker'>VOL", f);
+    ir_remote_key(f, dev, "Volume up", "volumeup|volup", "Plus", "");
+    ir_remote_key(f, dev, "Volume down", "volumedown|voldown|voldn", "Minus", "");
+    fputs("</div><div class='remote-dpad'>", f);
+    ir_remote_key(f, dev, "Up", "up|directionup|arrowup|cursorup", "ChevronUp", "up");
+    ir_remote_key(f, dev, "Left", "left|directionleft|arrowleft|cursorleft", "ChevronLeft", "left");
+    ir_remote_key(f, dev, "OK", "ok|select|enter", "", "center");
+    ir_remote_key(f, dev, "Right", "right|directionright|arrowright|cursorright", "ChevronRight", "right");
+    ir_remote_key(f, dev, "Down", "down|directiondown|arrowdown|cursordown", "ChevronDown", "down");
+    fputs("</div><div class='remote-rocker'>CH", f);
+    ir_remote_key(f, dev, "Channel up", "channelup|chup|chnext|pageup", "Plus", "");
+    ir_remote_key(f, dev, "Channel down", "channeldown|chdown|chdn|chprev|pagedown", "Minus", "");
+    fputs("</div></div><div class='remote-row'>", f);
+    ir_remote_key(f, dev, "Back", "back|return", "Undo2", "");
+    ir_remote_key(f, dev, "Mute", "mute", "VolumeX", "");
+    ir_remote_key(f, dev, "Settings", "settings|setup|options", "Settings", "");
+    fputs("</div><div class='remote-row'>", f);
+    ir_remote_key(f, dev, "Rewind", "rewind|rew|rev", "Rewind", "");
+    ir_remote_key(f, dev, "Play", "play", "Play", "");
+    ir_remote_key(f, dev, "Pause", "pause", "Pause", "");
+    ir_remote_key(f, dev, "Forward", "forward|fastforward|ffwd", "FastForward", "");
+    fputs("</div><div class='remote-colors'>", f);
+    ir_remote_key(f, dev, "Red", "red|redbutton", "", "red");
+    ir_remote_key(f, dev, "Green", "green|greenbutton", "", "green");
+    ir_remote_key(f, dev, "Yellow", "yellow|yellowbutton", "", "yellow");
+    ir_remote_key(f, dev, "Blue", "blue|bluebutton", "", "blue");
+    fputs("</div></div>", f);
 }
 
 static void ir_render_device_workspace(FILE *f, const struct ir_device *dev, int active) {
-    int j, quick_count = dev->command_count <= 80 ? dev->command_count : 80;
+    int j, quick_count = dev->command_count;
     fprintf(f, "<div class='ir-device-workspace%s' data-ir-device='", active ? " active" : "");
     html(f, dev->id);
-    fprintf(f, "'><div class='ir-work-head'><div><h3>");
+    fprintf(f, "'><div class='ir-work-head'><div class='remote-title'><img class='remote-thumb' data-remote-skin alt=''><div><h3>");
     html(f, dev->name[0] ? dev->name : "Unnamed device");
     fprintf(f, "</h3><div class='muted mini'>");
     html(f, dev->manufacturer);
     fprintf(f, " ");
     html(f, dev->model);
-    fprintf(f, " / ");
-    html(f, dev->type);
-    fprintf(f, " / %d saved commands</div></div><div class='actions'><button type='button' class='secondary' data-next-step='library'>Add from database</button><button type='button' class='ghost' data-next-step='learn'>Learn button</button></div></div>", dev->command_count);
-    fprintf(f, "<div class='ir-status muted mini' data-ir-status='");
+    fprintf(f, "</div></div></div><div class='actions'><button type='button' class='secondary' data-next-step='learn'>Learn button</button></div></div>");
+    fprintf(f, "<div class='ir-status mini' role='status' aria-live='polite' data-ir-status='");
     html(f, dev->id);
     fprintf(f, "'>Ready.</div>");
     fprintf(f, "<div class='ir-control-layout'>");
-    ir_render_remote_skin(f, dev);
-    fprintf(f, "<div class='ir-command-tools'><div><label>Find saved command</label><input class='ir-command-filter' data-command-filter='");
+    ir_render_remote(f, dev);
+    fprintf(f, "<div class='ir-command-tools'><div><label>Find saved command</label><input aria-label='Find saved command' class='ir-command-filter' data-command-filter='");
     html(f, dev->id);
     fprintf(f, "' placeholder='power, hdmi, volume, menu'></div>");
-    fprintf(f, "<div><h3>All saved buttons</h3><div class='ir-quick-grid' data-command-list='");
+    fprintf(f, "<div><h3>Saved commands</h3><div class='ir-quick-grid' data-command-list='");
     html(f, dev->id);
     fprintf(f, "'>");
     for (j = 0; j < quick_count; j++) ir_quick_send_button(f, dev, &dev->commands[j]);
     if (quick_count == 0) fprintf(f, "<div class='muted mini'>No commands saved yet. Search a database or learn buttons below.</div>");
     fprintf(f, "</div>");
-    if (dev->command_count > quick_count) {
-        fprintf(f, "<div class='help'>Showing the first %d commands. Use the full command list below to send or edit the rest.</div>", quick_count);
-    }
     fprintf(f, "</div></div></div></div>");
 }
 
@@ -3615,7 +3748,7 @@ static void ir_render_device_editor(FILE *f, const struct ir_device *dev, int ac
     fprintf(f, " / ");
     html(f, dev->type);
     fprintf(f, " / %d saved commands</div></div><div class='actions'><button type='button' class='secondary' data-next-step='library'>Add commands from database</button><button type='button' class='ghost' data-next-step='learn'>Learn button</button><button type='button' class='ghost' data-view-target='control'>Open remote control</button></div></div>", dev->command_count);
-    fprintf(f, "<h3>Device details</h3><form method='post' action='/ir/device#ir'><input type='hidden' name='deviceId' value='");
+    fprintf(f, "<details class='device-management'><summary>Device details</summary><form method='post' action='/ir/device#ir'><input type='hidden' name='deviceId' value='");
     html(f, dev->id);
     fprintf(f, "'><div class='row'><div><label>Name</label><input name='name' value='");
     html(f, dev->name);
@@ -3628,10 +3761,9 @@ static void ir_render_device_editor(FILE *f, const struct ir_device *dev, int ac
     fprintf(f, "'></div></div><div class='actions'><button type='submit'>Save device details</button></div></form>");
     fprintf(f, "<form method='post' action='/ir/delete-device#ir'><input type='hidden' name='deviceId' value='");
     html(f, dev->id);
-    fprintf(f, "'><div class='actions'><button class='danger' type='submit'>Delete device</button></div></form>");
-    fprintf(f, "<h3 style='margin-top:16px'>Commands</h3><div class='help'>Add, edit, or delete saved commands.</div>");
+    fprintf(f, "'><div class='actions'><button class='danger' type='submit'>Delete device</button></div></form></details>");
     ir_command_editor(f, dev->id, NULL, 0);
-    fprintf(f, "<details open><summary>Saved commands</summary><div class='command-list mini' data-command-list='");
+    fprintf(f, "<details><summary>Manage saved commands (%d)</summary><div class='command-list mini' data-command-list='", dev->command_count);
     html(f, dev->id);
     fprintf(f, "'>");
     for (j = 0; j < dev->command_count; j++) {
@@ -3640,11 +3772,7 @@ static void ir_render_device_editor(FILE *f, const struct ir_device *dev, int ac
         html(f, cmd->name);
         fprintf(f, "'><div><strong>");
         html(f, cmd->name);
-        fprintf(f, "</strong><div class='muted'>Protocol %d / learned from remote: %s</div><div class='muted'>",
-            cmd->protocol_id, cmd->learned ? "yes" : "no");
-        if (cmd->has_raw) fprintf(f, "raw timing recording");
-        else html(f, cmd->keycode);
-        fprintf(f, "</div></div><div class='actions'>");
+        fprintf(f, "</strong></div><div class='actions'>");
         ir_quick_send_button(f, dev, cmd);
         fprintf(f, "<form method='post' action='/ir/delete-command#ir'><input type='hidden' name='deviceId' value='");
         html(f, dev->id);
@@ -3659,7 +3787,7 @@ static void ir_render_device_editor(FILE *f, const struct ir_device *dev, int ac
 }
 
 static void ir_setup_flow(FILE *f, const struct ir_inventory *inv) {
-    fprintf(f, "<div class='setup-shell'><div class='wizard-top'><div><h3>Add or find remote commands</h3><div class='subtle'>Save the device, find codes, learn missing buttons, then test.</div></div><span class='pill'>%d devices</span></div>", inv->device_count);
+    fprintf(f, "<div class='setup-shell'><div class='wizard-top'><h3>Device setup</h3><button type='button' class='ghost' onclick=\"this.closest('.setup-shell').classList.remove('open')\">Close</button></div>");
     fprintf(f, "<div class='wizard-grid'><div class='stepper'>");
     fprintf(f, "<button type='button' class='step active' data-step-target='device'><span>1</span><div>Device<div class='subtle'>What it is</div></div></button>");
     fprintf(f, "<button type='button' class='step' data-step-target='library'><span>2</span><div>Search<div class='subtle'>Find codes</div></div></button>");
@@ -3677,11 +3805,11 @@ static void ir_setup_flow(FILE *f, const struct ir_inventory *inv) {
     fprintf(f, "<label>Device</label><select id='wizardDevice' name='deviceId'>");
     ir_device_options(f, inv, NULL);
     fprintf(f, "</select><label>Command name</label><input id='wizardCommandName' name='name' required placeholder='Power Toggle'>");
-    fprintf(f, "<div class='row'><div><label>Save format</label><select id='wizardMode' name='mode'><option value='auto' selected>Choose automatically</option><option value='keycode'>Harmony compact code</option><option value='nec'>NEC 32-bit code</option><option value='raw'>Raw timing recording</option></select></div>");
+    fprintf(f, "<details><summary>Signal data</summary><div class='row'><div><label>Save format</label><select id='wizardMode' name='mode'><option value='auto' selected>Choose automatically</option><option value='keycode'>Harmony compact code</option><option value='nec'>NEC 32-bit code</option><option value='raw'>Raw timing recording</option></select></div>");
     fprintf(f, "<div><label>Protocol</label><select id='wizardProtocol' name='protocol'><option value='2'>NEC-compatible</option><option value='679'>MemorexO1 32 Bit</option></select></div></div>");
     fprintf(f, "<label>NEC hex code</label><input id='wizardNec' name='nec' placeholder='E0E040BF'>");
     fprintf(f, "<label>Harmony compact code</label><input id='wizardKeycode' name='keycode' placeholder='G:Toshiba 32 Bit:(0xE0E040BF)(Repeat)():3'>");
-    fprintf(f, "<label>Captured signal data</label><textarea id='wizardRaw' name='raw' placeholder=''></textarea>");
+    fprintf(f, "<label>Captured signal data</label><textarea id='wizardRaw' name='raw' placeholder=''></textarea></details>");
     fprintf(f, "<div id='wizardLearnStatus' class='wizard-status mini'></div>");
     fprintf(f, "<div class='actions'><button id='wizardCapture' type='button'>Capture from remote</button><button id='wizardLearnTest' type='button' class='secondary'>Test captured button</button><button type='submit' class='secondary'>Save command</button><button type='button' class='ghost' data-next-step='library'>Search databases</button><button type='button' class='ghost' data-next-step='verify'>Test saved commands</button></div></form></div>");
 
@@ -3712,7 +3840,7 @@ static void ir_control_panel(FILE *f) {
     struct ir_inventory *inv = (struct ir_inventory *)calloc(1, sizeof(*inv));
     int i;
     if (!inv) return;
-    fprintf(f, "<section id='view-control' data-view='control' class='section'><div class='section-head'><div><h2>Remote control</h2><div class='section-lead'>Choose a saved device, then send its buttons.</div></div></div>");
+    fprintf(f, "<section id='view-control' data-view='control' class='section active'><div class='section-head'><h2>Remote</h2><button type='button' class='secondary' data-next-step='device'>Add device</button></div>");
     if (load_ir_inventory(inv) != 0) {
         fprintf(f, "<div class='panel'><pre>Unable to read ");
         html(f, DEVICE_LIST);
@@ -3721,7 +3849,7 @@ static void ir_control_panel(FILE *f) {
         return;
     }
     if (inv->device_count > 0) {
-        fprintf(f, "<div class='ir-stored-layout'><div class='panel'><h3>Stored remotes</h3><div class='muted mini'>Choose a saved remote.</div><div class='ir-device-picks'>");
+        fprintf(f, "<div class='ir-stored-layout'><div class='panel'><h3>Devices</h3><div class='ir-device-picks'>");
         for (i = 0; i < inv->device_count; i++) {
             const struct ir_device *dev = &inv->devices[i];
             fprintf(f, "<button type='button' class='ir-device-pick%s' data-ir-device-pick='",
@@ -3751,7 +3879,7 @@ static void ir_panel(FILE *f) {
     struct ir_inventory *inv = (struct ir_inventory *)calloc(1, sizeof(*inv));
     int i;
     if (!inv) return;
-    fprintf(f, "<section id='view-ir' data-view='ir' class='section'><div class='section-head'><div><h2>IR setup</h2><div class='section-lead'>Create or edit devices, find codes, and learn missing buttons.</div></div></div>");
+    fprintf(f, "<section id='view-ir' data-view='ir' class='section'><div class='section-head'><h2>Devices</h2><button type='button' data-next-step='device'>Add device</button></div>");
     if (load_ir_inventory(inv) != 0) {
         fprintf(f, "<div class='panel'><pre>Unable to read ");
         html(f, DEVICE_LIST);
@@ -3761,7 +3889,7 @@ static void ir_panel(FILE *f) {
     }
     ir_setup_flow(f, inv);
     if (inv->device_count > 0) {
-        fprintf(f, "<div class='ir-stored-layout'><div class='panel'><h3>Edit existing devices</h3><div class='muted mini'>Choose a saved device to edit details or commands.</div><div class='ir-device-picks'>");
+        fprintf(f, "<div class='ir-stored-layout'><div class='panel'><div class='ir-device-picks'>");
         for (i = 0; i < inv->device_count; i++) {
             const struct ir_device *dev = &inv->devices[i];
             fprintf(f, "<button type='button' class='ir-device-pick%s' data-ir-device-pick='",
@@ -4773,13 +4901,15 @@ static void handle_ir_send(int fd, const struct request *req) {
         return;
     }
     repair_known_protocols_for_current_commands();
-    send_ir_command_action(device_id, command, reply, sizeof(reply));
-    snprintf(message, sizeof(message), "Sent %s to %s. Reply: %s", command, device_id, reply[0] ? reply : "no response");
+    if (send_ir_command_action(device_id, command, reply, sizeof(reply)) == 0)
+        snprintf(message, sizeof(message), "Hub accepted %s.", command);
+    else snprintf(message, sizeof(message), "Send failed: %s", reply);
     render_page(fd, message);
 }
 
 static void render_ir_send_json(int fd, const struct request *req) {
     char device_id[64], command[128], reply[4096];
+    int rc;
     FILE *f;
     form_value(req->body, "deviceId", device_id, sizeof(device_id));
     form_value(req->body, "command", command, sizeof(command));
@@ -4791,12 +4921,84 @@ static void render_ir_send_json(int fd, const struct request *req) {
         return;
     }
     repair_known_protocols_for_current_commands();
-    send_ir_command_action_ex(device_id, command, "api", "", reply, sizeof(reply));
-    f = send_json_start(fd, "200 OK");
+    rc = send_ir_command_action_ex(device_id, command, "api", "", reply, sizeof(reply));
+    f = send_json_start(fd, rc == 0 ? "200 OK" : "502 Bad Gateway");
     if (!f) return;
-    fputs("{\"ok\":true,\"deviceId\":", f); json_write_string(f, device_id);
+    fprintf(f, "{\"ok\":%s,\"deviceId\":", rc == 0 ? "true" : "false"); json_write_string(f, device_id);
     fputs(",\"command\":", f); json_write_string(f, command);
     fputs(",\"reply\":", f); json_write_string(f, reply[0] ? reply : "no response");
+    if (rc != 0) { fputs(",\"error\":", f); json_write_string(f, reply); }
+    fputs("}\n", f);
+    fclose(f);
+}
+
+static int renew_ir_hold(const char *path) {
+    struct timespec t;
+    char text[64];
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    snprintf(text, sizeof(text), "%lld\n", (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000);
+    return write_file_atomic(path, text, strlen(text));
+}
+
+static void render_ir_hold_json(int fd, const struct request *req) {
+    char device[64], command[128], run[128], phase[16], lease[192], cancel[192];
+    char hub[64], action[512], params[768], esc_hub[128], esc_params[1536], cmd[2304], reply[4096] = "";
+    int lock = -1, rc = -1;
+    FILE *f;
+    form_value(req->body, "runId", run, sizeof(run));
+    form_value(req->body, "phase", phase, sizeof(phase));
+    form_value(req->body, "deviceId", device, sizeof(device));
+    form_value(req->body, "command", command, sizeof(command));
+    if (!safe_run_id(run) || (strcmp(phase, "start") != 0 && strcmp(phase, "keepalive") != 0)) {
+        snprintf(reply, sizeof(reply), "Invalid hold request.");
+        goto respond;
+    }
+    snprintf(lease, sizeof(lease), IR_HOLD_PREFIX "%s", run);
+    ir_cancel_path(run, cancel, sizeof(cancel));
+    if (strcmp(phase, "keepalive") == 0) {
+        /* A renewal must never create a hold or revive one that has stopped. */
+        rc = access(lease, F_OK) == 0 && !ir_run_canceled(run) ? renew_ir_hold(lease) : 0;
+        goto respond;
+    }
+    if (!safe_label(device) || !safe_label(command)) {
+        snprintf(reply, sizeof(reply), "Invalid IR command request.");
+        goto respond;
+    }
+    lock = lock_ir(reply, sizeof(reply));
+    if (lock < 0) goto respond;
+    {
+        char *raw = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, NULL);
+        const char *obj, *end;
+        int found = raw && find_ir_command_span(raw, device, command, &obj, &end) == 0;
+        free(raw);
+        if (!found) {
+            snprintf(reply, sizeof(reply), "Saved IR command not found.");
+            goto done;
+        }
+    }
+    repair_known_protocols_for_current_commands();
+    if (prepare_ir(hub, sizeof(hub), reply, sizeof(reply)) != 0) goto done;
+    if (ir_run_canceled(run)) { rc = 0; goto done; }
+    if (renew_ir_hold(lease) != 0) {
+        snprintf(reply, sizeof(reply), "Cannot start hold timer.");
+        goto done;
+    }
+    snprintf(action, sizeof(action), "{\\\"type\\\":\\\"IRCommand\\\",\\\"deviceId\\\":\\\"%s\\\",\\\"command\\\":\\\"%s\\\"}", device, command);
+    snprintf(params, sizeof(params), "{\"action\":\"%s\"}", action);
+    shell_escape_single(hub, esc_hub, sizeof(esc_hub));
+    shell_escape_single(params, esc_params, sizeof(esc_params));
+    snprintf(cmd, sizeof(cmd), CODEX_BIN_DIR "/codex_hbus '%s' harmony.engine?holdaction '%s' --hold '%s' '%s' 2>&1", esc_hub, esc_params, lease, cancel);
+    rc = run_cmd(cmd, reply, sizeof(reply));
+    log_ir_event("hold", run, device, command, reply);
+done:
+    unlink(lease);
+    unlink(cancel);
+    close(lock);
+respond:
+    f = send_json_start(fd, rc == 0 ? "200 OK" : "400 Bad Request");
+    if (!f) return;
+    fprintf(f, "{\"ok\":%s,\"%s\":", rc == 0 ? "true" : "false", rc == 0 ? "reply" : "error");
+    json_write_string(f, reply[0] ? reply : (rc == 0 ? "Stopped." : "Hold failed."));
     fputs("}\n", f);
     fclose(f);
 }
@@ -4857,17 +5059,18 @@ static void render_ir_batch_send_json(int fd, const struct request *req) {
         }
         attempted++;
         if (!dry_run) {
-            send_ir_command_action_ex(device_id, cmd_name, "api-batch", run_id, reply, sizeof(reply));
+            int rc = send_ir_command_action_ex(device_id, cmd_name, "api-batch", run_id, reply, sizeof(reply));
             copy_text(last_reply, sizeof(last_reply), reply[0] ? reply : "no response");
-            if (strstr(reply, "\"code\":500") || strstr(reply, "Invalid command")) failed++;
+            if (rc != 0) failed++;
+            else sent++;
+            line = strtok_r(NULL, "\n", &save);
             if (delay_ms > 0 && cancelable_sleep_ms(delay_ms, run_id)) {
                 canceled = 1;
-                sent++;
                 break;
             }
+        } else {
+            line = strtok_r(NULL, "\n", &save);
         }
-        sent++;
-        line = strtok_r(NULL, "\n", &save);
     }
     while (line) {
         skipped++;
@@ -4875,7 +5078,7 @@ static void render_ir_batch_send_json(int fd, const struct request *req) {
     }
     gettimeofday(&end, NULL);
     free(commands);
-    if (sent == 0 && !canceled) {
+    if (attempted == 0 && !canceled) {
         f = send_json_start(fd, "400 Bad Request");
         if (!f) return;
         fputs("{\"ok\":false,\"error\":\"no valid commands selected\"}\n", f);
@@ -4979,16 +5182,6 @@ static int safe_bt_addr(const char *s) {
     return 1;
 }
 
-static int safe_bt_token(const char *s, size_t maxlen) {
-    const unsigned char *p = (const unsigned char *)s;
-    size_t n = strlen(s);
-    if (n == 0 || n > maxlen) return 0;
-    while (*p) {
-        if (!isalnum(*p) && *p != '_' && *p != '-') return 0;
-        p++;
-    }
-    return 1;
-}
 
 static int safe_bt_pin(const char *s) {
     const unsigned char *p = (const unsigned char *)s;
@@ -5070,16 +5263,6 @@ static int run_hal_json(const char *cmd_name, const char *params_json, int timeo
     return run_cmd(cmd, out, outlen);
 }
 
-static int run_hal_json_binary_hex(const char *cmd_name, const char *params_json, const char *payload_hex, int timeout, char *out, size_t outlen) {
-    char esc_cmd[128], esc_params[2048], esc_payload[512], cmd[3000];
-    if (timeout < 1) timeout = 1;
-    if (timeout > 30) timeout = 30;
-    shell_escape_single(cmd_name, esc_cmd, sizeof(esc_cmd));
-    shell_escape_single(params_json, esc_params, sizeof(esc_params));
-    shell_escape_single(payload_hex, esc_payload, sizeof(esc_payload));
-    snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hal_ltcp '%s' '%s' %d '%s' 2>&1", esc_cmd, esc_params, timeout, esc_payload);
-    return run_cmd(cmd, out, outlen);
-}
 
 static int run_hal_json_binary_sequence(const char *cmd_name, const char *params_json, const char *sequence, int timeout, int gap_ms, char *out, size_t outlen) {
     char esc_cmd[128], esc_params[2048], esc_path[256], cmd[3000], path[160];
@@ -6235,7 +6418,7 @@ static void render_bluetooth_call_json(int fd, const struct request *req) {
 static void render_ir_test_learned_json(int fd, const struct request *req) {
     char device_id[64], name[128], mode[32], protocol[32], nec[64], keycode[512], raw[2048];
     char temp_name[128], add_msg[512], cleanup_msg[512], reply[4096], run_id[128];
-    int add_rc, cleanup_rc = -1;
+    int add_rc, send_rc = -1, cleanup_rc = -1;
     FILE *f;
 
     form_value(req->body, "deviceId", device_id, sizeof(device_id));
@@ -6266,15 +6449,15 @@ static void render_ir_test_learned_json(int fd, const struct request *req) {
     reply[0] = 0;
     if (add_rc == 0) {
         snprintf(run_id, sizeof(run_id), "learn_%ld_%d", (long)time(NULL), (int)(getpid() % 10000));
-        usleep(800000);
-        send_ir_command_action_ex(device_id, temp_name, "api-learn-test", run_id, reply, sizeof(reply));
+        send_rc = send_ir_command_action_ex(device_id, temp_name, "api-learn-test", run_id, reply, sizeof(reply));
         cleanup_rc = delete_ir_command(device_id, temp_name, cleanup_msg, sizeof(cleanup_msg));
     } else {
         cleanup_msg[0] = 0;
     }
-    f = send_json_start(fd, add_rc == 0 ? "200 OK" : "400 Bad Request");
+    f = send_json_start(fd, add_rc != 0 ? "400 Bad Request" : send_rc != 0 ? "502 Bad Gateway" : "200 OK");
     if (!f) return;
-    fputs("{\"ok\":", f); fputs(add_rc == 0 ? "true" : "false", f);
+    fputs("{\"ok\":", f); fputs(add_rc == 0 && send_rc == 0 ? "true" : "false", f);
+    if (add_rc != 0 || send_rc != 0) { fputs(",\"error\":", f); json_write_string(f, add_rc != 0 ? add_msg : reply); }
     fputs(",\"deviceId\":", f); json_write_string(f, device_id);
     fputs(",\"tempCommand\":", f); json_write_string(f, add_rc == 0 ? temp_name : "");
     fputs(",\"addMessage\":", f); json_write_string(f, add_msg);
@@ -6497,33 +6680,27 @@ static void free_request(struct request *req) {
     req->body_len = 0;
 }
 
+#include "local_api.h"
+
 static int read_request(int fd, struct request *req) {
     char *buf;
     char *header_end, *line_end, *p;
-    int n = 0, clen, orig_clen, header_len;
+    int n = 0, clen, orig_clen = 0, header_len, have_length = 0;
     memset(req, 0, sizeof(*req));
     buf = (char *)malloc(MAX_REQUEST_BYTES);
     if (!buf) return -1;
     while (n < MAX_REQUEST_BYTES - 1) {
-        int got = recv(fd, buf + n, MAX_REQUEST_BYTES - 1 - n, 0);
+        int got = recv(fd, buf + n, n < 8192 ? 8192 - n : 0, 0);
         if (got <= 0) {
             free(buf);
             return -1;
         }
         n += got;
+        if (memchr(buf, 0, n)) { free(buf); return -1; }
         buf[n] = 0;
         header_end = strstr(buf, "\r\n\r\n");
         if (header_end) {
             header_len = (int)(header_end + 4 - buf);
-            orig_clen = content_length(buf);
-            if (orig_clen < 0) orig_clen = 0;
-            clen = orig_clen;
-            while (n < header_len + orig_clen && n < MAX_REQUEST_BYTES - 1) {
-                got = recv(fd, buf + n, MAX_REQUEST_BYTES - 1 - n, 0);
-                if (got <= 0) break;
-                n += got;
-                buf[n] = 0;
-            }
             line_end = strstr(buf, "\r\n");
             if (!line_end) {
                 free(buf);
@@ -6539,9 +6716,27 @@ static int read_request(int fd, struct request *req) {
                 if (strncasecmp(p, "Authorization:", 14) == 0) {
                     char *v = p + 14;
                     while (*v == ' ' || *v == '\t') v++;
+                    if (req->auth[0] || e - v >= sizeof(req->auth)) { free(buf); return -1; }
                     snprintf(req->auth, sizeof(req->auth), "%.*s", (int)(e - v), v);
                 }
+                if (strncasecmp(p, "Content-Length:", 15) == 0) {
+                    char *v = p + 15, *end; unsigned long length;
+                    while (v < e && (*v == ' ' || *v == '\t')) v++;
+                    if (have_length++ || v == e || !isdigit((unsigned char)*v)) { free(buf); return -1; }
+                    errno = 0; length = strtoul(v, &end, 10);
+                    while (end < e && (*end == ' ' || *end == '\t')) end++;
+                    if (errno || end != e) { free(buf); return -1; }
+                    if (length > MAX_REQUEST_BODY) { req->body_truncated = 1; free(buf); return 0; }
+                    orig_clen = (int)length;
+                }
+                if (local_read_header(req, p, e) != 0) { free(buf); return -1; }
                 p = e + 2;
+            }
+            while (n < header_len + orig_clen) {
+                got = recv(fd, buf + n, header_len + orig_clen - n, 0);
+                if (got <= 0) break;
+                if (memchr(buf + n, 0, got)) { free(buf); return -1; }
+                n += got; buf[n] = 0;
             }
             if (orig_clen > 0) {
                 int available = n - header_len;
@@ -6580,129 +6775,26 @@ static void send_payload_too_large(int fd, const struct request *req) {
 
 static void handle_client(int client) {
     struct request req;
-    if (read_request(client, &req) != 0) {
-        free_request(&req);
-        return;
-    }
-    if (!webui_auth_ok(&req)) {
-        send_auth_required(client);
-        free_request(&req);
-        return;
-    }
-    if (req.body_truncated) {
-        send_payload_too_large(client, &req);
-        free_request(&req);
-        return;
-    }
-    if (strcmp(req.method, "GET") == 0 && (strcmp(req.path, "/") == 0 || strcmp(req.path, "/index.html") == 0)) {
-        render_page(client, "");
-    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/api/inventory") == 0) {
-        render_inventory_json(client);
-    } else if ((strcmp(req.method, "GET") == 0 || strcmp(req.method, "POST") == 0) &&
-        strncmp(req.path, "/api/device-commands", 20) == 0 &&
-        (req.path[20] == 0 || req.path[20] == '?')) {
-        render_device_commands_json(client, &req);
-    } else if ((strcmp(req.method, "GET") == 0 || strcmp(req.method, "POST") == 0) &&
-        strncmp(req.path, "/api/remotecentral-fetch", 24) == 0 &&
-        (req.path[24] == 0 || req.path[24] == '?')) {
-        render_remotecentral_fetch_json(client, &req);
-    } else if ((strcmp(req.method, "GET") == 0 || strcmp(req.method, "POST") == 0) && strcmp(req.path, "/api/capture") == 0) {
-        render_capture_json(client);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/ir-send") == 0) {
-        render_ir_send_json(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/ir-test-learned") == 0) {
-        render_ir_test_learned_json(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/ir-batch-send") == 0) {
-        render_ir_batch_send_json(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/ir-cancel") == 0) {
-        render_ir_cancel_json(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/ir-lab-target") == 0) {
-        render_ir_lab_target_json(client);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/ir-lab-clear") == 0) {
-        render_ir_lab_clear_json(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/bt-call") == 0) {
-        render_bluetooth_call_json(client, &req);
-    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/api/bt-text-status") == 0) {
-        render_bluetooth_text_status_json(client);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/bt-text") == 0) {
-        render_bluetooth_text_json(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/bt-saved-command") == 0) {
-        render_bt_saved_command_json(client, &req);
-    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/api/update-status") == 0) {
-        render_update_status_json(client);
-    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/api/update-check-state") == 0) {
-        render_update_check_state_json(client);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/update-check-state") == 0) {
-        render_update_check_state_post_json(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/update-begin") == 0) {
-        render_update_begin_json(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/update-chunk") == 0) {
-        render_update_chunk_json(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/update-apply") == 0) {
-        render_update_apply_json(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/irdb-import") == 0) {
-        render_irdb_import_json(client, &req);
-    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/bundle") == 0) {
-        send_bundle_download(client);
-    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/devices") == 0) {
-        send_file_download(client, DEVICE_LIST, "DeviceList.json", "application/json");
-    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/functions") == 0) {
-        send_file_download(client, FUNCTION_LIST, "FunctionList.json", "application/json");
-    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/protocols") == 0) {
-        send_file_download(client, PROTOCOL_LIST, "ProtocolList.json", "application/json");
-    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/mqtt") == 0) {
-        send_file_download(client, MQTT_CONFIG, "mqtt-config.json", "application/json");
-    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/wifi") == 0) {
-        send_file_download(client, WPA_CONFIG, "wpa_supplicant.conf", "text/plain");
-    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/cloud") == 0) {
-        send_cloud_download(client);
-    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/bluetooth") == 0) {
-        send_bt_devices_download(client);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/mqtt") == 0) {
-        handle_mqtt(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/wifi") == 0) {
-        handle_wifi(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/system") == 0) {
-        handle_system(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/import") == 0) {
-        handle_import(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/send") == 0) {
-        handle_ir_send(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/device") == 0) {
-        handle_ir_device(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/new-device") == 0) {
-        handle_ir_new_device(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/command") == 0) {
-        handle_ir_command(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/update-command") == 0) {
-        handle_ir_update_command(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/irdb-import") == 0) {
-        handle_irdb_import(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/capture") == 0) {
-        handle_ir_capture(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/delete-device") == 0) {
-        handle_ir_delete_device(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/delete-command") == 0) {
-        handle_ir_delete_command(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/bt/device") == 0) {
-        handle_bt_device(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/bt/delete-device") == 0) {
-        handle_bt_delete_device(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/bt/command") == 0) {
-        handle_bt_command(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/bt/delete-command") == 0) {
-        handle_bt_delete_command(client, &req);
-    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/bt/send-command") == 0) {
-        handle_bt_send_command(client, &req);
-    } else {
-        send_text(client, "404 Not Found", "not found\n");
-    }
+    if (read_request(client, &req) != 0) { free_request(&req); return; }
+    if (req.body_truncated) { send_payload_too_large(client, &req); free_request(&req); return; }
+    if (local_dispatch(client, &req) || local_compat_dispatch(client, &req)) { free_request(&req); return; }
+    if (!local_legacy_authorize(client, &req)) { free_request(&req); return; }
+    if (!strcmp(req.path, "/api/inventory")) render_inventory_json(client);
+    else if (!strncmp(req.path, "/api/device-commands", 20) && (!req.path[20] || req.path[20] == '?')) render_device_commands_json(client, &req);
+    else if (!strcmp(req.path, "/export/devices")) send_file_download(client, DEVICE_LIST, "DeviceList.json", "application/json");
+    else if (!strcmp(req.path, "/export/functions")) send_file_download(client, FUNCTION_LIST, "FunctionList.json", "application/json");
+    else if (!strcmp(req.path, "/export/protocols")) send_file_download(client, PROTOCOL_LIST, "ProtocolList.json", "application/json");
+    else if (!strcmp(req.path, "/export/bluetooth")) send_bt_devices_download(client);
+    else local_error(client, "410 Gone", "Use the versioned local API.");
     free_request(&req);
 }
 
+static pid_t http_workers[8];
 static void reap_children(void) {
     int saved_errno = errno;
-    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+    pid_t pid; size_t i;
+    while ((pid = waitpid(-1, NULL, WNOHANG)) > 0)
+        for (i = 0; i < 8; i++) if (http_workers[i] == pid) http_workers[i] = 0;
     errno = saved_errno;
 }
 
@@ -6729,8 +6821,29 @@ static void start_bthid_keyboard_runtime(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--trim-logs") == 0) return local_trim_logs();
+    if (argc > 1 && strcmp(argv[1], "--inventory") == 0) return local_inventory();
+    if (argc > 1 && strcmp(argv[1], "--sync") == 0) { sync(); return 0; }
+    if (argc > 1 && strcmp(argv[1], "--claim-code") == 0) return local_claim_code();
+    if (argc > 1 && strcmp(argv[1], "--coordinator") == 0) return local_coordinator();
+    if (argc > 1 && strcmp(argv[1], "--health") == 0) return local_health();
+    if (argc > 1 && strcmp(argv[1], "--update-health") == 0) return local_update_health();
+    if (argc > 1 && strcmp(argv[1], "--rollback") == 0) return local_rollback();
+    if (argc > 1 && strcmp(argv[1], "--internal-key") == 0) {
+        char key[65]; if (local_initialize()) return 1;
+        if (access(LOCAL_ROOT "/internal.key", F_OK) == 0) return 0;
+        return local_random(key, 32) || write_file_atomic(LOCAL_ROOT "/internal.key", key, strlen(key));
+    }
+    if (argc > 3 && strcmp(argv[1], "--space") == 0) {
+        struct statvfs s; unsigned long long need = strtoull(argv[3], NULL, 10), available;
+        if (statvfs(argv[2], &s)) return 1; available = (unsigned long long)s.f_bavail * s.f_frsize;
+        printf("Available: %llu bytes; required: %llu bytes\n", available, need + LOCAL_RESERVE);
+        return available < need + LOCAL_RESERVE;
+    }
+    if (local_initialize() != 0) { fprintf(stderr, "Local configuration recovery failed; refusing startup.\n"); return 1; }
     int port = argc > 1 ? atoi(argv[1]) : 8080;
-    int fd, one = 1;
+    int fd, button_fd, one = 1;
+    struct local_button button = {0};
     struct sigaction sa;
     struct sockaddr_in addr;
     signal(SIGPIPE, SIG_IGN);
@@ -6759,24 +6872,58 @@ int main(int argc, char **argv) {
         return 1;
     }
     fprintf(stderr, "codex_webui listening on %d\n", port);
+    /* Restart requires a fresh request and press, never a buffered approval. */
+    unlink(LOCAL_PAIR_WINDOW);
+    button_fd = open(LOCAL_BUTTON_DEVICE, O_RDONLY | O_NONBLOCK);
+    local_button_available = button_fd >= 0;
     while (1) {
         int client;
+        fd_set ready;
+        size_t slot;
+        sigset_t blocked, saved;
         pid_t pid;
         reap_children();
+        FD_ZERO(&ready); FD_SET(fd, &ready);
+        if (button_fd >= 0) FD_SET(button_fd, &ready);
+        if (select((button_fd > fd ? button_fd : fd) + 1, &ready, NULL, NULL, NULL) < 0) continue;
+        if (button_fd >= 0 && FD_ISSET(button_fd, &ready)) {
+            struct input_event event; ssize_t n;
+            while ((n = read(button_fd, &event, sizeof(event))) == sizeof(event)) local_button_event(&button, &event);
+            if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {
+                close(button_fd); button_fd = -1; local_button_available = 0;
+                unlink(LOCAL_PAIR_WINDOW); memset(&button, 0, sizeof(button));
+            }
+        }
+        if (!FD_ISSET(fd, &ready)) continue;
         client = accept(fd, NULL, NULL);
         if (client < 0) {
             if (errno == EINTR) continue;
             continue;
         }
+        sigemptyset(&blocked); sigaddset(&blocked, SIGCHLD); sigprocmask(SIG_BLOCK, &blocked, &saved);
+        reap_children();
+        for (slot = 0; slot < 8 && http_workers[slot]; slot++) {}
+        if (slot == 8) {
+            sigprocmask(SIG_SETMASK, &saved, NULL);
+            send_text(client, "503 Service Unavailable", "Hub is busy. Try again.\n"); close(client); continue;
+        }
         pid = fork();
         if (pid == 0) {
+            /* The listener reaps workers; each worker must reap its own helpers. */
+            signal(SIGCHLD, SIG_DFL);
+            sigprocmask(SIG_SETMASK, &saved, NULL);
             close(fd);
+            if (button_fd >= 0) close(button_fd);
+            { struct timeval timeout = {5, 0}; setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)); }
+            alarm(45);
             handle_client(client);
             close(client);
             _exit(0);
         }
+        if (pid > 0) http_workers[slot] = pid;
+        sigprocmask(SIG_SETMASK, &saved, NULL);
         if (pid < 0) {
-            handle_client(client);
+            send_text(client, "503 Service Unavailable", "Hub is busy. Try again.\n");
         }
         close(client);
     }

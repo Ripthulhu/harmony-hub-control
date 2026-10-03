@@ -1,14 +1,8 @@
--rwxrwxr-x 1 codex codex 117808 Jun  9 06:18 codex_bthid_keyboard
--rwxrwxr-x 1 codex codex 104168 Jun  9 06:18 codex_dhcpd
--rwxrwxr-x 1 codex codex 108764 Jun  9 06:18 codex_hal_ltcp
--rwxrwxr-x 1 codex codex 104244 Jun  9 06:18 codex_hbus
--rwxrwxr-x 1 codex codex 109548 Jun  9 06:18 codex_portal
--rwxrwxr-x 1 codex codex 541264 Jun  9 07:19 codex_webui
--rwxrwxr-x 1 codex codex 577296 Jun  9 06:18 dropbearmulti
-2f0a6fc6303743eeccc77d1b93e7253f  codex_dhcpd
-bd1a7e51f476ea3a680741ca9b321b14  codex_portal
-08e82a3210808cd01e1067ba1f8f22f9  codex_hbus
-4c40847878f3bb3d9ee9213c177e0a29  codex_hal_ltcp
 a20c26c86514c671a4720c0069f80b7e  codex_bthid_keyboard
-1a29c3d5dc7d546b6c8c63f878351f96  codex_webui
+2f0a6fc6303743eeccc77d1b93e7253f  codex_dhcpd
+4c40847878f3bb3d9ee9213c177e0a29  codex_hal_ltcp
+66885f24237df3f29293820cfdd15cab  codex_hbus
+d16934c94f0cf1bc12f947e61accb931  codex_portal
+b1b308738d7e0db8fb7a3c35fce9dab7  codex_webui
 3733327fd04bca282dbf06f33da0bf6c  dropbearmulti
+034252e3dc78cb548d6b99d6dcbad836  FILES

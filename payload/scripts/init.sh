@@ -13,19 +13,19 @@ fi
 
 if [ -x /data/codex/bin/dropbear ]; then
   echo '#!/bin/sh' > /usr/sbin/dropbear
-  echo 'exec /data/codex/bin/dropbear -K 300 "$@"' >> /usr/sbin/dropbear
+  echo 'exec /data/codex/bin/dropbear -s -g -K 300 "$@"' >> /usr/sbin/dropbear
   chmod 755 /usr/sbin/dropbear
-  if ps | grep '[d]ropbear -s -g' >/dev/null 2>&1; then
-    killall dropbear 2>/dev/null || true
-    /usr/sbin/dropbear
-  elif ! ps | grep '[d]ropbear' >/dev/null 2>&1; then
+  if ! ps | grep '[d]ropbear' >/dev/null 2>&1; then
     /usr/sbin/dropbear
   fi
 fi
 
 if [ -x /data/codex/bin/codex_webui ]; then
-  if ! ps | grep '[c]odex_webui' >/dev/null 2>&1; then
+  if ! ps | grep '[c]odex_webui 8080' >/dev/null 2>&1; then
     /data/codex/bin/codex_webui 8080 >> "$LOG" 2>&1 &
+  fi
+  if ! ps | grep '[c]odex_webui --coordinator' >/dev/null 2>&1; then
+    /data/codex/bin/codex_webui --coordinator >> "$LOG" 2>&1 &
   fi
 fi
 
@@ -45,10 +45,23 @@ if [ -x /data/codex/recovery_ap.sh ]; then
 fi
 
 (
-  sleep 70
+  ready=0
+  while [ "$ready" -lt 60 ]; do
+    [ -f /tmp/harmony-operations/core-ready ] && grep -q ':1F98 00000000:0000 0A' /proc/net/tcp && break
+    sleep 1
+    ready=$(expr "$ready" + 1)
+  done
+  if [ "$ready" -ge 60 ]; then
+    echo "$(date) local engine or HBus not ready after 60 seconds; integration startup skipped" >> "$LOG"
+    exit 0
+  fi
   if [ -n "$HUB_ID" ] && [ -x /data/codex/bin/codex_hbus ]; then
     /data/codex/bin/codex_hbus "$HUB_ID" "harmony.automation?discover" '{"gatewayType":"codexmqtt"}' >> "$LOG" 2>&1
   fi
 ) &
+
+if [ -x /data/codex/maintenance.sh ]; then
+  /data/codex/maintenance.sh watchdog >> "$LOG" 2>&1 &
+fi
 
 echo "$(date) codex init done" >> "$LOG"

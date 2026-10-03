@@ -1,4 +1,8 @@
 #!/bin/sh
+if [ -x /data/codex/release_recovery.sh ]; then
+  /data/codex/release_recovery.sh recover-network
+  /data/codex/release_recovery.sh update-check &
+fi
 
 # pimento initialization
 TDE=$(cat /sys/class/input/input0/tde)

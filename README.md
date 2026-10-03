@@ -1,212 +1,97 @@
 # Harmony Hub Control
 
-Local web UI and helper runtime for an already rooted Logitech Harmony Hub.
+A local remote that runs on the Harmony Hub. Open `http://<hub-ip>:8080/` from
+your phone or computer. No always-on computer or Logitech account is needed for
+the installed local controls.
 
-This repository is for post-root device ownership work: the web dashboard, IR
-database tooling, Bluetooth HID controls, MQTT/Home Assistant bridge, recovery
-AP helpers, and the installer that deploys those pieces over SSH.
+This is a development build for Harmony Hub firmware **4.15.600**. It keeps
+the native IR, Bluetooth and handheld services. It does not replace U-Boot,
+the kernel, radio firmware or manufacturing data.
 
-It does not contain rooting tools, device compromise notes, private keys, live
-MQTT credentials, firmware dumps, or personal backups.
+## Install
 
-## Current Status
+You need Python 3, OpenSSH and an owner SSH key. For Wi-Fi provisioning or
+initial rooting, keep [harmony-hub-root](https://github.com/Ripthulhu/harmony-hub-root)
+beside this checkout, or pass its location with `--root-tool`.
 
-- Web UI runs on `http://<hub-ip>:8080/`.
-- HTTP authentication is intentionally disabled for LAN-only use.
-- IR devices can be configured from database lookup or manual learning.
-- Database import supports IRDB, Flipper-IRDB, and RemoteCentral-style Pronto
-  sources.
-- Flipper parsed `RC5`, `RC6`, `SIRC`, `SIRC15`, and `SIRC20` entries are
-  converted to raw timing replays when possible.
-- The IR sweep page can stage large command sets in browser memory, import
-  selected commands to the hub, and send them in cancellable batches.
-- Bluetooth HID mode can expose the hub as a keyboard-class device and send
-  keystroke scripts through the auto-started hub-side FIFO runtime.
-- MQTT bridge publishes Home Assistant discovery and exposes hub/device state.
-- Recovery helpers can start a local AP workflow from the reset button path.
+On Windows, open **Install_Harmony_Control.cmd**. On Linux or macOS:
 
-## Repository Layout
-
-```text
-.
-  Install_Harmony_Control.cmd
-                           Double-click post-root installer for Windows
-  install_webui.ps1        Windows installer for rooted hubs with SSH
-  install_webui.py         Linux/macOS Python installer for rooted hubs
-  restore_backup.ps1       Restores the installer's hub-side backup
-  payload/
-    bin/                   MIPS binaries shipped to the hub
-    scripts/               Init, recovery, Dropbear wrappers, cloud suppression
-    mqtt/                  MQTT bridge Lua plugin
-    source/                C sources for the native helper binaries
-  tools/
-    ir_database_smoke_test.mjs
-  build/
-    build_harmony_tools_kali.sh
-  docs/
-    AI_HANDOFF.md
-    API.md
-    BUILD.md
-    GITHUB_SETUP.md
-    SECURITY.md
-  examples/
-    mqtt-config.example.json
+```sh
+python3 setup.py
 ```
 
-The shipped binaries target the Harmony Hub's MIPS big-endian Linux userspace.
-No build server is required to install the current payload.
+The desktop flow offers USB Wi-Fi provisioning, discovers the hub, uses the
+existing LAN root tool if necessary, verifies a sensitive backup on your
+computer, installs the local runtime and opens the UI. Enter a browser name,
+choose **Pair with hub button**, then briefly press and release Pair on the
+back of the hub. Physical pairing grants full access. The installer code is an
+alternative for the first browser; owner approval in Settings can grant other
+browsers remote-control-only access. A control-only browser can request full
+access in Settings and confirm with a fresh Pair-button press.
 
-## Quick Install
+For a hub that already has owner SSH access:
 
-Run after the hub has just been rooted with the LAN root tool. The installer
-uses your Harmony SSH key. It looks in `.ssh` for a private key whose filename
-starts with `harmony_owner_`:
-
-```text
-%USERPROFILE%\.ssh\harmony_owner_*
-~/.ssh/harmony_owner_*
+```sh
+python3 install_webui.py --hub-host <hub-ip> --key-path <owner-key> --no-prompt
 ```
 
-The installer also needs the real numeric Harmony Hub ID for local HBus
-commands. If you rooted the hub with `harmony-hub-root`, this is read
-automatically from the handoff file under `.harmony-hub`. If the handoff file is
-missing, pass the exact value printed by the root tool as `hub_id=...`:
+The numeric Hub ID is read from the existing root-tool handoff or the hub.
+Use `--hub-id <id>` only when you know the real value. Existing devices,
+handheld configurations, owner access and MQTT settings are preserved.
+A normal reboot activates the new service and listener restrictions.
 
-```powershell
-.\install_webui.ps1 -HubHost <hub-ip> -HubId <numeric-id>
+## Everyday Use
+
+- **Remote:** last-used device or activity, supported buttons and searchable extra commands.
+- **Devices:** add IR profiles, import files, learn commands or pair a supported Bluetooth profile.
+- **Activities:** choose power/input actions, delays and remote button assignments.
+- **Settings:** approve controllers, export backups, change Wi-Fi and configure optional MQTT/Home Assistant.
+
+A tap sends one press. Holding an IR button uses native press/hold/release.
+Releasing, leaving the page or losing the connection stops it. IR state is an
+estimate; a successful send does not prove that the TV responded.
+
+Choose **Keep existing setup** on first use. Supported local devices can be
+edited; original native activity configurations are preserved, not silently
+converted. Generic Bluetooth mice and offline handheld remapping are outside
+this release.
+
+## Recovery And Updates
+
+The installer creates a verified ZIP backup before changing the hub. Keep it
+private: it contains credentials and keys. Validate a backup without changing
+anything:
+
+```sh
+python3 restore_backup.py <backup.zip> --hub-host <hub-ip> --key-path <owner-key>
 ```
 
-```bash
-python3 install_webui.py --hub-host <hub-ip> --hub-id <numeric-id>
-```
+Add `--apply --reboot` to restore its files through owner SSH. USB network
+recovery and stock reset/firmware flashing remain in the existing desktop
+tool. A stock factory reset may remove this installation.
 
-Do not use a guessed Hub ID; IR, capture, MQTT, and dashboard HBus calls depend
-on the real value. The installer does not prompt for a Hub ID interactively,
-because guessed numeric values are accepted by the shell but fail against the
-hub.
+Browser updates require an Ed25519-signed bundle and an owner-supplied trusted
+public key. Unsigned releases are rejected. See [Build notes](docs/BUILD.md).
 
-### Windows
+## Limits Before Release
 
-Double-click:
+Fresh setup after a stock factory reset is **not verified** and is disabled in
+the UI. Missing-resource initialization is opt-in for a separately scheduled
+blank-hub test. Do not reset your only hub to try it.
 
-```text
-Install_Harmony_Control.cmd
-```
+Phone/desktop visual checks, physical Bluetooth and learning tests, full
+internet-blocked tests and a 24-hour offline soak remain release gates.
+See [Acceptance status](docs/STANDALONE_STATUS.md) for the evidence.
 
-Enter the hub IP address when prompted. The installer also prompts for MQTT
-broker settings; leave the broker blank to install the UI with MQTT disabled for
-now.
+The UI uses trusted-LAN **HTTP**, not HTTPS. Pairing does not encrypt traffic.
+Do not expose it to the internet. Owner SSH is key-only; stock XMPP and HBus
+listeners are restricted to loopback. See [Security](docs/SECURITY.md) and
+[API](docs/API.md).
 
-The installer uses only plain `ssh` and remote `cat` over stdin to copy files.
-It does not require `scp`, `sftp`, or `tftp`, which are not available in the
-minimal Dropbear SSH environment installed by the root tool.
+## Development
 
-PowerShell can also be run directly:
-
-```powershell
-.\install_webui.ps1 -HubHost <hub-ip>
-```
-
-### Linux/macOS
-
-Use the Python 3 installer from the repository root:
-
-```bash
-python3 install_webui.py --hub-host <hub-ip>
-```
-
-For a non-interactive install with MQTT disabled:
-
-```bash
-python3 install_webui.py --hub-host <hub-ip> --key-path ~/.ssh/harmony_owner_<key-name> --mqtt-disabled --no-prompt
-```
-
-The installer will prompt for missing values, create a backup on the hub, upload
-the runtime, start Dropbear if needed, start the web UI, and write MQTT config
-if provided.
-
-By default the installer enables the web UI's cloud blocker setting. That keeps
-Logitech cloudapi, PubNub, and package-manager background tasks from starting
-while local web, MQTT, Bluetooth, Wi-Fi recovery, and SSH control continue to
-work. Fresh installs reboot once at the end so the patched network-service
-startup is actually active before the handoff finishes. Owners can change it
-later from **System > Cloud blocker** and use **Save and reboot** to apply the
-new mode.
-
-To stage the setting without the install-time reboot:
-
-```powershell
-.\install_webui.ps1 -HubHost <hub-ip> -NoApplyCloudRestart
-```
-
-```bash
-python3 install_webui.py --hub-host <hub-ip> --no-apply-cloud-restart
-```
-
-Open the UI afterward:
-
-```text
-http://<hub-ip>:8080/
-```
-
-## Rollback
-
-Restore the newest backup created by the installer:
-
-```powershell
-.\restore_backup.ps1 -HubHost <hub-ip> -KeyPath "$env:USERPROFILE\.ssh\<root-key-file>"
-```
-
-## Development Workflow
-
-Keep changes scoped and reviewable:
-
-1. Edit `payload/source/codex_webui.c` or the relevant payload script/plugin.
-2. Rebuild MIPS binaries only when native source changes.
-3. Replace the corresponding file under `payload/bin/`.
-4. Update `payload/bin/MANIFEST.txt`.
-5. Install to a test hub with `install_webui.ps1` on Windows or `install_webui.py` on Linux/macOS.
-6. Verify the dashboard, IR import, Bluetooth HID, MQTT, and rollback paths.
-
-Do not commit local secrets, hub backups, firmware dumps, root tooling, or
-credentials. See `docs/SECURITY.md` before sharing the repository.
-
-For script and integration control, see `docs/API.md`.
-
-## Useful Checks
-
-Page check:
-
-```powershell
-Invoke-WebRequest -Uri "http://<hub-ip>:8080/" -UseBasicParsing
-```
-
-Process and checksum check:
-
-```powershell
-ssh -i "$env:USERPROFILE\.ssh\<root-key-file>" root@<hub-ip> "ps | grep '[c]odex_webui'; ps | grep '[c]odex_bthid_keyboard'; ps | grep '[d]ropbear'; md5sum /data/codex/bin/codex_webui"
-```
-
-Logs:
-
-```powershell
-ssh -i "$env:USERPROFILE\.ssh\<root-key-file>" root@<hub-ip> "tail -80 /cache/codex-init.log; tail -80 /data/codex/ir-events.log 2>/dev/null"
-```
-
-IR database parser smoke test:
-
-```powershell
-node .\tools\ir_database_smoke_test.mjs --sample=24 --per-device=10 --source=all --dry-run
-```
-
-Linux/macOS:
-
-```bash
-node ./tools/ir_database_smoke_test.mjs --sample=24 --per-device=10 --source=all --dry-run
-```
-
-To create test devices and import supported commands without sending IR:
-
-```powershell
-node .\tools\ir_database_smoke_test.mjs --sample=8 --per-device=8 --source=all --configure --hub=http://<hub-ip>:8080
-```
+Edit the separate HTML/CSS/JavaScript in `payload/www/`, Lua in
+`payload/core/` and `payload/mqtt/`, and native code in `payload/source/`.
+There are no runtime CDNs, external fonts, Node/Python services or database
+server on the hub. Backups, keys, firmware dumps and proprietary stock files
+must stay outside the repository.
