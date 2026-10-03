@@ -28,11 +28,7 @@ CC=mips-buildroot-linux-uclibc-gcc
 STRIP=mips-buildroot-linux-uclibc-strip
 
 "$CC" -Os -static -s -o "$OUT/codex_dhcpd" "$SRC/codex_dhcpd.c"
-"$CC" -Os -static -s -o "$OUT/codex_portal" "$SRC/codex_portal.c"
-"$CC" -Os -static -s -o "$OUT/codex_hbus" "$SRC/codex_hbus.c"
-"$CC" -Os -static -s -o "$OUT/codex_hal_ltcp" "$SRC/codex_hal_ltcp.c"
-"$CC" -Os -static -s -o "$OUT/codex_bthid_keyboard" "$SRC/codex_bthid_keyboard.c"
-"$CC" -Os -static -s -o "$OUT/codex_webui" "$SRC/codex_webui.c"
+python3 "$REPO_ROOT/tools/build_payload.py" --cc "$CC" --output "$OUT"
 
 DROPBEAR_VERSION=2025.89
 DROPBEAR_TARBALL="$BUILD/dropbear-$DROPBEAR_VERSION.tar.bz2"

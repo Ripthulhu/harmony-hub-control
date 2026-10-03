@@ -1,5 +1,4 @@
 /* Local API shares the proven hardware senders above, not their old HTTP policy. */
-#include "vendor/cJSON.h"
 #include "vendor/monocypher.h"
 #include "vendor/monocypher-ed25519.h"
 #include <linux/input.h>
@@ -29,46 +28,6 @@ static const char *local_files[] = {LOCAL_CONFIG, DEVICE_LIST, FUNCTION_LIST,
     PROTOCOL_LIST, BT_DEVICE_STORE, ACTIVITY_LIST, MAP_LIST};
 static int local_validate_config(const cJSON *o);
 
-static cJSON *lj_get(const cJSON *o, const char *key) { return cJSON_GetObjectItemCaseSensitive(o, key); }
-static const char *lj_str(const cJSON *o, const char *key) {
-    cJSON *v = lj_get(o, key); return cJSON_IsString(v) ? v->valuestring : "";
-}
-static int lj_int(const cJSON *o, const char *key, int def) {
-    cJSON *v = lj_get(o, key); return cJSON_IsNumber(v) ? v->valueint : def;
-}
-static int lj_unique(const cJSON *v, int depth) {
-    const cJSON *a, *b;
-    if (depth > 32) return 0;
-    for (a = v->child; a; a = a->next) {
-        if (cJSON_IsObject(v)) for (b = a->next; b; b = b->next)
-            if (a->string && b->string && strcmp(a->string, b->string) == 0) return 0;
-        if (!lj_unique(a, depth + 1)) return 0;
-    }
-    return 1;
-}
-static cJSON *lj_parse(const char *s) {
-    cJSON *o = s ? cJSON_ParseWithOpts(s, NULL, 1) : NULL;
-    if (o && !lj_unique(o, 0)) { cJSON_Delete(o); o = NULL; }
-    return o;
-}
-static cJSON *lj_read(const char *path, size_t max) {
-    char *raw = read_file_alloc(path, max, NULL);
-    cJSON *o = lj_parse(raw); free(raw); return o;
-}
-static int lj_write(const char *path, const cJSON *o) {
-    char *raw = cJSON_PrintUnformatted(o);
-    int rc = raw ? write_file_atomic(path, raw, strlen(raw)) : -1;
-    free(raw); return rc;
-}
-static void lj_reply(int fd, const char *status, const cJSON *o) {
-    char *raw = cJSON_PrintUnformatted(o); FILE *f = send_json_start(fd, status);
-    if (f) { fputs(raw ? raw : "{\"ok\":false,\"error\":\"Out of memory\"}", f); fclose(f); }
-    free(raw);
-}
-static void local_error(int fd, const char *status, const char *msg) {
-    cJSON *o = cJSON_CreateObject(); cJSON_AddBoolToObject(o, "ok", 0);
-    cJSON_AddStringToObject(o, "error", msg); lj_reply(fd, status, o); cJSON_Delete(o);
-}
 static int local_random(char *out, size_t bytes) {
     unsigned char raw[32]; size_t n = 0; int fd;
     if (bytes > sizeof(raw)) return -1;
@@ -443,39 +402,6 @@ static int local_trim_logs(void) {
     return 0;
 }
 
-static cJSON *local_form_json(const cJSON *body, struct request *r) {
-    cJSON *item; size_t size = 1, n = 0; char *form;
-    cJSON_ArrayForEach(item, body) if (item->string) size += strlen(item->string) * 3 + (cJSON_IsString(item) ? strlen(item->valuestring) * 3 : 32) + 2;
-    if (size > MAX_REQUEST_BODY) return NULL;
-    form = malloc(size); if (!form) return NULL;
-    cJSON_ArrayForEach(item, body) {
-        const char *s; char number[32]; int part;
-        if (!item->string) continue;
-        if (cJSON_IsString(item)) s = item->valuestring;
-        else if (cJSON_IsNumber(item)) { snprintf(number, sizeof(number), "%d", item->valueint); s = number; }
-        else if (cJSON_IsBool(item)) s = cJSON_IsTrue(item) ? "1" : "0";
-        else continue;
-        if (n) form[n++] = '&';
-        for (part = 0; part < 2; part++) {
-            const unsigned char *p = (const unsigned char *)(part ? s : item->string);
-            while (*p) { if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.') form[n++] = *p;
-                else { sprintf(form + n, "%%%02X", *p); n += 3; } p++; }
-            if (!part) form[n++] = '=';
-        }
-    }
-    form[n] = 0; memset(r, 0, sizeof(*r)); strcpy(r->method, "POST"); r->body = form; r->body_len = n;
-    return (cJSON *)body;
-}
-static cJSON *local_call_renderer(void (*render)(int, const struct request *), const cJSON *body) {
-    int pair[2]; char buf[16384]; ssize_t n, used = 0; struct request r; cJSON *out = NULL;
-    if (!local_form_json(body, &r)) return NULL;
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) { free(r.body); return NULL; }
-    render(pair[0], &r); shutdown(pair[0], SHUT_WR);
-    while ((n = read(pair[1], buf + used, sizeof(buf) - 1 - used)) > 0) { used += n; if (used >= sizeof(buf) - 1) break; }
-    buf[used] = 0;
-    { char *p = strstr(buf, "\r\n\r\n"); if (p) out = lj_parse(p + 4); }
-    close(pair[0]); close(pair[1]); free(r.body); return out;
-}
 static int local_ctl_active(const char *id) {
     cJSON *pairs, *p; int ok = 0;
     if (strcmp(id, "internal") == 0) return 1;
@@ -578,8 +504,8 @@ static int local_coordinator(void) {
                 }
                 cJSON_DeleteItemFromObjectCaseSensitive(body, "runId"); cJSON_AddStringToObject(body, "runId", lj_str(op, "id"));
                 cJSON_DeleteItemFromObjectCaseSensitive(body, "phase"); cJSON_AddStringToObject(body, "phase", "start");
-                result = local_call_renderer(render_ir_hold_json, body);
-            } else if (strcmp(kind, "tap") == 0) result = local_call_renderer(render_ir_send_json, body);
+                result = execute_ir_hold(body);
+            } else if (strcmp(kind, "tap") == 0) result = execute_ir_tap(body);
             else if (strcmp(kind, "bluetooth") == 0) {
                 char msg[1024]; int lock = lock_ir(msg, sizeof(msg)), rc = -1;
                 if (lock >= 0) { rc = send_bt_saved_command(lj_str(body, "deviceId"), lj_str(body, "command"), msg, sizeof(msg)); close(lock); }
@@ -966,7 +892,7 @@ static int local_dispatch(int fd, const struct request *r) {
     } else if (!strcmp(r->path, "/api/v1/bluetooth/pair") && !get) {
         const char *action = lj_str(body, "action");
         if (strcmp(action, "pairing_on") && strcmp(action, "pairing_off") && strcmp(action, "adapter_status") && strcmp(action, "connect") && strcmp(action, "status")) local_error(fd, "400 Bad Request", "Unsupported pairing action.");
-        else { out = local_call_renderer(render_bluetooth_call_json, body); if (out) { lj_reply(fd, "200 OK", out); cJSON_Delete(out); } else local_error(fd, "502 Bad Gateway", "Bluetooth service did not respond."); }
+        else { out = execute_bluetooth_pair(body); if (out) { lj_reply(fd, "200 OK", out); cJSON_Delete(out); } else local_error(fd, "502 Bad Gateway", "Bluetooth service did not respond."); }
     } else if (!strcmp(r->path, "/api/v1/activities/native") && get) send_file_download(fd, ACTIVITY_LIST, "native-activities.json", "application/json");
     else if (!strncmp(r->path, "/api/v1/updates/", 16) && !get) local_updates(fd, r, body);
     else if (!strcmp(r->path, "/api/v1/integrations/mqtt")) local_mqtt(fd, r, body);

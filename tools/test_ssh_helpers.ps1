@@ -33,22 +33,4 @@ $assignment = $rollback.Find({param($node) $node -is [System.Management.Automati
 Invoke-Expression $assignment.Extent.Text
 Assert ($restore.Contains('backup="$B/$1"')) "Rollback path expanded on Windows instead of the hub"
 
-# Load only the upload functions, never the installer's top-level deployment.
-$tokens = $null
-$errors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root "install_webui.ps1"), [ref]$tokens, [ref]$errors)
-$ast.FindAll({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-    $node.Name -in @("Split-RemoteDir", "Upload-Bytes", "Upload-Text", "Upload-Data")}, $true) |
-    ForEach-Object { Invoke-Expression $_.Extent.Text }
-function Invoke-Remote($Command, [byte[]]$InputBytes, $TimeoutMs) {
-    $script:captured = @{Command=$Command; Bytes=$InputBytes; Timeout=$TimeoutMs}
-}
-function Info($Message) { $script:info = $Message }
-Upload-Text "text" "/data/config.json" "600"
-Assert ($captured.Bytes.Length -eq 4 -and $captured.Timeout -ge 90000) "Text upload"
-Assert ($info -match "md5=<hidden>") "Secret hash exposed"
-Upload-Bytes (Join-Path $root "ssh_helpers.ps1") "/tmp/it's here" "755"
-Assert ($captured.Command.Contains((Remote-Quote "/tmp/it's here"))) "Upload path quoting"
-Assert ($captured.Command.Contains("&& mv ") -and $captured.Command.Contains("&& chmod 755 ")) "Atomic upload"
-Assert ($captured.Bytes.Length -eq (Get-Item (Join-Path $root "ssh_helpers.ps1")).Length) "Binary upload"
-Write-Host "PowerShell syntax, prompts, SSH quoting, and upload checks passed"
+Write-Host "PowerShell syntax, prompts, SSH quoting, and restore checks passed"

@@ -2,11 +2,6 @@
 PATH=/data/codex/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ROOT=/data/codex/local
 case "$1" in
-  recover-network)
-    if [ -f "$ROOT/wifi.pending" ] && [ -f "$ROOT/wifi.previous" ]; then
-      cp "$ROOT/wifi.previous" /etc/wpa_supplicant.conf && chmod 600 /etc/wpa_supplicant.conf && rm -f "$ROOT/wifi.pending"
-    fi
-    ;;
   wifi-try)
     sleep 2
     wpa_cli -i ath0 reconfigure >/dev/null 2>&1
@@ -37,20 +32,6 @@ case "$1" in
       fi
       sleep 30
     done
-    ;;
-  update-check)
-    [ -f "$ROOT/update.pending" ] || exit 0
-    tries=0
-    while [ "$tries" -lt 60 ]; do
-      if /data/codex/bin/codex_webui --update-health; then
-        rm -f "$ROOT/update.pending"
-        echo 'Release passed startup health checks' > "$ROOT/update.result"
-        exit 0
-      fi
-      sleep 1; tries=$(expr "$tries" + 1)
-    done
-    # This known-good binary is kept outside the signed activation file set.
-    /cache/harmony-recovery --rollback && /sbin/reboot
     ;;
   *) exit 2 ;;
 esac

@@ -86,3 +86,30 @@ Deployed SHA-256:
 Still required: real Bluetooth and IR learning, native activity import coverage,
 network-change rollback under failure, full offline tests and the 24-hour soak.
 Fresh setup remains explicitly unverified.
+
+## Repository cleanup, 2026-10-04
+
+Removed the retired C-rendered dashboard, its form handlers, embedded JPEG and
+unsigned updater. Profile parsers now live in `payload/www/profiles.js`; their
+tests load that file directly. The current remote layout and controls are unchanged.
+
+Stock resource reads and edits use cJSON instead of string scanning and splicing.
+Edits retain unknown stock fields and reject files that exceed the resource limit.
+IR and Bluetooth commands return results directly to the coordinator/API, without
+an internal HTTP connection. Authenticated compatibility routes remain available.
+
+Removed the unused PowerShell uploader and duplicate maintenance recovery paths.
+The full build script uses `tools/build_payload.py` for the five shared helpers.
+The database smoke test is read-only and fails when a sampled file cannot be parsed.
+
+Passed disposable tests for pairing/access, configuration revisions, stock-field
+preservation, exact IDs, malformed/oversized resources, Bluetooth profile storage,
+signed updates, rollback, network recovery, MQTT and activities. Native IR/LTCP
+tests and browser hold/release tests passed, including delayed queue replies and
+failed renewals. Eleven offline profile fixtures and a sample of 347 commands from
+ten public profiles passed. Asset, Python-upload and PowerShell tests passed.
+
+All five MIPS helpers rebuilt. `codex_webui` is 339,236 bytes, down from 351,476;
+the other four helpers are unchanged. The rebuilt binary and checksum are in the
+repository. This cleanup has not been deployed to the live hub and does not close
+the outstanding hardware, blank-hub or offline-soak tests above.

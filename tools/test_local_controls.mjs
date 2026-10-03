@@ -3,21 +3,41 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 const source=fs.readFileSync(new URL('../payload/www/app.js',import.meta.url),'utf8');
 new vm.Script(source);
-const code=source.slice(source.indexOf('async function tap('),source.indexOf("['blur','pagehide']"));
-function setup(){
-  let now=0, sequence=0;
-  const timers=new Map(), calls=[], handlers={}, state={online:true,hold:null,devices:[{id:'tv',transport:'ir'}]};
+const code=source.slice(source.indexOf('async function tap('),source.indexOf('function drawer()'));
+function setup({delayQueue=false}={}){
+  let now=0, sequence=0, failRenew=false, queue, finish;
+  const timers=new Map(), calls=[], handlers={}, globals={}, state={online:true,hold:null,devices:[{id:'tv',transport:'ir'}]};
   const button={dataset:{device:'tv',command:'VolumeUp'},classList:{add(){},remove(){}},setAttribute(){},setPointerCapture(){},
     getBoundingClientRect:()=>({left:0,top:0,right:60,bottom:60}),addEventListener:(name,fn)=>handlers[name]=fn};
-  const context=vm.createContext({state,Date:{now:()=>now},notice(){},
-    setTimeout:(fn,ms)=>{timers.set(++sequence,{fn,at:now+ms});return sequence;},clearTimeout:id=>timers.delete(id),
-    setInterval:()=>++sequence,clearInterval(){},
-    api:async(path,body)=>{calls.push({path,...body});return {id:'operation-1'};},operation:()=>new Promise(()=>{})});
-  vm.runInContext(code+'\nbindCommands(root);',vm.createContext({...context,root:{querySelectorAll:()=>[button]}}));
+  const schedule=(fn,ms,repeat=false)=>{timers.set(++sequence,{fn,at:now+ms,ms,repeat});return sequence;};
+  const surface={hidden:false,addEventListener:(name,fn)=>globals[name]=fn};
+  const context=vm.createContext({state,Date:{now:()=>now},notice(){},root:{querySelectorAll:()=>[button]},window:surface,document:surface,
+    setTimeout:(fn,ms)=>schedule(fn,ms),clearTimeout:id=>timers.delete(id),
+    setInterval:(fn,ms)=>schedule(fn,ms,true),clearInterval:id=>timers.delete(id),
+    api:async(path,body)=>{
+      calls.push({path,...body});
+      if(body.action==='keepalive'&&failRenew)throw Error('offline');
+      if(body.mode==='hold'&&delayQueue)return new Promise(resolve=>queue=resolve);
+      return {id:'operation-1'};
+    },operation:()=>new Promise((resolve,reject)=>finish={resolve,reject})});
+  vm.runInContext(code+'\nbindCommands(root);',context);
   const flush=async()=>{for(let i=0;i<12;i++)await Promise.resolve();};
-  async function advance(ms){now+=ms;for(const [id,t] of [...timers])if(t.at<=now){timers.delete(id);t.fn();}await flush();}
+  async function advance(ms){
+    const end=now+ms;
+    while(true){
+      const due=[...timers].filter(([,t])=>t.at<=end).sort((a,b)=>a[1].at-b[1].at)[0];
+      if(!due)break;
+      const [id,t]=due;now=t.at;
+      if(t.repeat)t.at+=t.ms;else timers.delete(id);
+      t.fn();await flush();
+    }
+    now=end;await flush();
+  }
   function event(type,props={}){handlers[type]?.({button:0,pointerId:1,key:'Enter',repeat:false,clientX:30,clientY:30,preventDefault(){},...props});}
-  return {event,advance,flush,calls,state};
+  return {event,advance,flush,calls,state,timers,surface,
+    surfaceEvent:type=>globals[type]?.(),failRenew:()=>failRenew=true,
+    finish:async(error=false)=>{error?finish.reject(Error('failed')):finish.resolve({state:'completed'});await flush();},
+    queued:async()=>{queue({id:'operation-1'});await flush();}};
 }
 let t=setup();t.event('pointerdown');await t.advance(100);t.event('pointerup');t.event('click');await t.flush();
 assert.equal(t.calls.filter(c=>c.path==='commands/send').length,1);
@@ -31,6 +51,32 @@ for(const stop of ['pointerup','keyup','pointercancel','lostpointercapture','blu
   assert.equal(t.calls.filter(c=>c.path==='commands/send').length,1,'release must not send an extra tap');
 }
 console.log('New remote: touch, keyboard, long-hold release, pointer cancellation and synthetic-click suppression passed');
+
+for(const stop of ['blur','pagehide','visibilitychange']){
+  t=setup();t.event('pointerdown');await t.advance(550);
+  assert.equal(t.calls.filter(c=>c.action==='keepalive').length,1);
+  t.surface.hidden=true;t.surfaceEvent(stop);await t.advance(1000);
+  assert.equal(t.calls.filter(c=>c.action==='cancel').length,1,stop);
+  assert.equal(t.timers.size,0);
+}
+t=setup({delayQueue:true});t.event('pointerdown');await t.advance(300);t.event('pointerup');await t.queued();
+assert.equal(t.calls.filter(c=>c.action==='cancel').length,1);
+assert.equal(t.calls.filter(c=>c.mode==='tap').length,0);
+assert.equal(t.timers.size,0);
+t=setup();t.event('pointerdown');await t.advance(300);t.failRenew();await t.advance(250);
+assert.equal(t.state.hold,null);assert.equal(t.calls.filter(c=>c.action==='cancel').length,1);
+assert.equal(t.timers.size,0);
+for(const error of [false,true]){
+  t=setup();t.event('pointerdown');await t.advance(300);await t.finish(error);t.event('pointerup');await t.flush();
+  assert.equal(t.state.hold,null);assert.equal(t.timers.size,0);
+  assert.equal(t.calls.filter(c=>c.mode==='tap').length,0);
+}
+t=setup();t.state.online=false;t.event('pointerdown');await t.advance(1000);t.event('pointerup');await t.flush();
+assert.equal(t.calls.length,0);
+t=setup();t.event('pointerdown');t.event('pointermove',{clientX:100});await t.advance(1000);
+assert.equal(t.calls.length,0);
+console.log('Hold renewal failure, queued-release race, hidden pages, completion/failure and offline controls passed');
+
 const remoteCode=source.slice(source.indexOf('const norm ='),source.indexOf('function renderRemote()'));
 const remote=vm.createContext({state:{devices:[{id:'tv',commands:[{name:'VolumeUp'}]}],config:{activities:[{id:'watch',buttons:[{slot:'volumeup',deviceId:'tv',command:'VolumeUp',label:'Volume'}]}]}},readLocal:key=>key==='harmony-activity'?'watch':'tv',escape:s=>String(s),icon:s=>s});
 vm.runInContext(remoteCode,remote);

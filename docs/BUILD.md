@@ -10,8 +10,9 @@ and an existing MIPS/uClibc compiler:
 python3 tools/build_payload.py --cc /path/to/mips-buildroot-linux-uclibc-gcc --output build/output
 ```
 
-The UI source is in `payload/www`. Its Lucide sprite and profile parsers are
-packaged with `tools/package_assets.mjs`; there are no runtime CDN dependencies.
+The UI source, including the standalone profile importers, is in `payload/www`.
+`tools/package_assets.mjs` packages the Lucide sprite. There are no runtime CDN
+dependencies, and neither tool extracts JavaScript from C source.
 
 ## Target
 
@@ -59,18 +60,26 @@ From the repository root on Linux:
 gcc -O0 tools/test_ir_runtime.c payload/source/vendor/cJSON.c payload/source/vendor/monocypher.c payload/source/vendor/monocypher-ed25519.c -o /tmp/test-ir && /tmp/test-ir
 gcc -O0 tools/test_hbus_hold.c -o /tmp/test-hold && /tmp/test-hold
 lua5.1 tools/test_mqtt_runtime.lua
-node tools/test_ir_controls.mjs
+node tools/test_profiles.mjs
 node tools/test_local_controls.mjs
 python3 tools/test_local_api.py
+python3 tools/test_recovery.py
+python3 tools/test_assets.py
 python3 tools/test_upload.py
 ```
 
 These check IR responses, holds, release timeouts, LTCP framing, MQTT discovery
-and reloads, browser button handling, and uploads without contacting a device.
+and reloads, profile imports, browser button handling, pairing, configuration
+preservation, recovery, signed updates, and uploads without contacting a device.
 Run the C checks on the build host, not a hub.
 
+`node tools/ir_database_smoke_test.mjs --sample 10 --seed cleanup` checks a
+repeatable sample from public profile databases. It downloads files but never
+changes a hub. Use the paired UI to import profiles.
+
 On Windows, also run `powershell -NoProfile -File tools/test_ssh_helpers.ps1`.
-The installer and rollback script share `ssh_helpers.ps1`; keep it alongside them.
+The rollback script uses `ssh_helpers.ps1`; keep them together. The PowerShell
+installer forwards its options to the shared Python installer.
 
 ## Signed Releases
 

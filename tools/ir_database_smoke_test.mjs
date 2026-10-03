@@ -29,12 +29,8 @@ function has(name) {
 }
 
 const sampleCount = Math.max(1, Math.min(500, Number(arg('sample', '10')) || 10));
-const perDevice = Math.max(1, Math.min(80, Number(arg('per-device', '12')) || 12));
-const hub = arg('hub', '').replace(/\/$/, '');
 const seedText = arg('seed', String(Date.now()));
 const sourceArg = arg('source', 'all').toLowerCase();
-const doConfigure = has('configure') && !!hub;
-const doDryRun = has('dry-run') || !doConfigure;
 const showUnsupported = has('show-unsupported');
 const pathFilters = process.argv
   .filter((x) => x.startsWith('--path='))
@@ -62,15 +58,9 @@ function pickMany(items, count) {
 
 function loadWebuiParser() {
   if (webuiParseIrText) return webuiParseIrText;
-  const sourcePath = pathModule.join(__dirname, '..', 'payload', 'source', 'codex_webui.c');
-  const c = fs.readFileSync(sourcePath, 'utf8');
-  const script = [...c.matchAll(/^\s*"((?:\\.|[^"\\])*)"\s*$/gm)]
-    .map((m) => JSON.parse(`"${m[1]}"`))
-    .join('');
-  const start = script.indexOf('const IRDB_BASE');
-  const end = script.indexOf('async function postJson');
-  if (start < 0 || end < 0) throw new Error('could not extract web UI IR parser');
+  const script = fs.readFileSync(pathModule.join(__dirname, '..', 'payload/www/profiles.js'), 'utf8');
   const context = {
+    window: {},
     console,
     fetch,
     atob: (s) => Buffer.from(String(s || '').replace(/\s+/g, ''), 'base64').toString('binary'),
@@ -95,18 +85,11 @@ function loadWebuiParser() {
         return { querySelector: () => null, querySelectorAll: () => [] };
       }
     },
-    $: () => null,
-    history: {},
-    location: {},
   };
   vm.createContext(context);
-  vm.runInContext(`${script.slice(start, end)};this.__parseIrText=parseIrText;`, context);
-  webuiParseIrText = (body, source, path) => context.__parseIrText(body, source, path);
+  vm.runInContext(script, context);
+  webuiParseIrText = (body, source, path) => context.window.harmonyParseProfile(body, source, path);
   return webuiParseIrText;
-}
-
-function safeImportName(s) {
-  return String(s || 'Command').replace(/[|"\r\n\\]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 96) || 'Command';
 }
 
 async function text(url) {
@@ -218,71 +201,9 @@ function summarize(parsed) {
   return { supported, compact, raw, unsupported };
 }
 
-function payloadLines(parsed, limit) {
-  return parsed.rows.filter((r) => r.keycode || r.raw).slice(0, limit).map((r) => {
-    const name = safeImportName(r.name);
-    return r.raw ? `${name}|raw|${r.raw}` : `${name}|${r.keycode}`;
-  });
-}
-
-function pathProfile(path) {
-  const bits = path.replace(/\.[^.]+$/, '').split(/[\\/]/).filter(Boolean);
-  const model = bits[bits.length - 1] || 'Database Device';
-  const manufacturer = bits.length >= 2 ? bits[bits.length - 2] : 'Database';
-  return {
-    manufacturer: manufacturer.replace(/[_-]+/g, ' ').slice(0, 64) || 'Database',
-    model: model.replace(/[_-]+/g, ' ').slice(0, 64) || 'Database Device',
-  };
-}
-
-async function postForm(path, data) {
-  const body = new URLSearchParams(data);
-  const r = await fetch(`${hub}${path}`, { method: 'POST', body, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-  const bodyText = await r.text();
-  if (!r.ok) throw new Error(`${path} HTTP ${r.status}: ${bodyText.slice(0, 180)}`);
-  return bodyText;
-}
-
-async function postJson(path, data) {
-  const body = new URLSearchParams(data);
-  const r = await fetch(`${hub}${path}`, { method: 'POST', body, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-  const bodyText = await r.text();
-  let parsed;
-  try {
-    parsed = JSON.parse(bodyText);
-  } catch {
-    throw new Error(`${path} returned non-JSON: ${bodyText.slice(0, 180)}`);
-  }
-  if (!r.ok || parsed.ok === false) throw new Error(parsed.error || parsed.message || `${path} HTTP ${r.status}`);
-  return parsed;
-}
-
-async function inventory() {
-  const r = await fetch(`${hub}/api/inventory`);
-  if (!r.ok) throw new Error(`/api/inventory HTTP ${r.status}`);
-  return r.json();
-}
-
-async function configureParsed(parsed, index) {
-  const lines = payloadLines(parsed, perDevice);
-  if (!lines.length) return { configured: false, message: 'no supported commands to import' };
-  const profile = pathProfile(parsed.path);
-  const name = `Smoke ${index + 1} ${profile.manufacturer} ${profile.model}`.replace(/\s+/g, ' ').slice(0, 96);
-  await postForm('/ir/new-device', {
-    name,
-    manufacturer: profile.manufacturer,
-    model: profile.model,
-    type: 'HomeAppliance',
-  });
-  const inv = await inventory();
-  const device = (inv.devices || []).find((d) => d.name === name);
-  if (!device) throw new Error(`created device not found in inventory: ${name}`);
-  const result = await postJson('/api/irdb-import', { deviceId: device.id, payload: lines.join('\n') });
-  return { configured: true, deviceId: device.id, name, message: result.message || '' };
-}
-
 async function main() {
-  console.log(`seed=${seedText} source=${sourceArg} sample=${sampleCount} perDevice=${perDevice} configure=${doConfigure} dryRun=${doDryRun}`);
+  if (has('configure') || arg('hub')) throw new Error('This parser check is read-only. Import profiles through the paired hub UI.');
+  console.log(`seed=${seedText} source=${sourceArg} sample=${sampleCount} readOnly=true`);
   const index = await loadIndex();
   console.log(`loaded ${index.length} database file entries`);
   let sample = pickMany(index, sampleCount);
@@ -295,8 +216,7 @@ async function main() {
       sample.push(found);
     }
   }
-  const report = [];
-  const totals = { files: 0, rows: 0, supported: 0, compact: 0, raw: 0, configured: 0 };
+  const totals = { files: 0, rows: 0, supported: 0, compact: 0, raw: 0, errors: 0 };
   const protocolGaps = new Map();
   for (let i = 0; i < sample.length; i++) {
     const entry = sample[i];
@@ -309,14 +229,8 @@ async function main() {
       totals.compact += sum.compact;
       totals.raw += sum.raw;
       for (const [k, v] of sum.unsupported.entries()) protocolGaps.set(k, (protocolGaps.get(k) || 0) + v);
-      let config = { configured: false, message: doDryRun ? 'dry-run' : '' };
-      if (doConfigure) {
-        config = await configureParsed(parsed, i);
-        if (config.configured) totals.configured++;
-      }
-      report.push({ entry, sum, config });
       const unsupported = parsed.rows.length - sum.supported;
-      console.log(`${i + 1}. ${entry.source} ${entry.path}: rows=${parsed.rows.length} supported=${sum.supported} compact=${sum.compact} raw=${sum.raw} unsupported=${unsupported}${config.configured ? ` -> ${config.name} (${config.deviceId})` : ''}`);
+      console.log(`${i + 1}. ${entry.source} ${entry.path}: rows=${parsed.rows.length} supported=${sum.supported} compact=${sum.compact} raw=${sum.raw} unsupported=${unsupported}`);
       if (showUnsupported && unsupported) {
         const examples = parsed.rows
           .filter((row) => !(row.raw || row.keycode))
@@ -326,11 +240,12 @@ async function main() {
       }
     } catch (e) {
       console.log(`${i + 1}. ${entry.source} ${entry.path}: ERROR ${e.message || e}`);
-      report.push({ entry, error: String(e.message || e) });
+      totals.errors++;
     }
   }
   console.log('\nsummary');
   console.log(JSON.stringify(totals, null, 2));
+  if (totals.errors) process.exitCode = 1;
   const gaps = Array.from(protocolGaps.entries()).sort((a, b) => b[1] - a[1]).slice(0, 20);
   if (gaps.length) {
     console.log('\nunsupported protocols / parser gaps');

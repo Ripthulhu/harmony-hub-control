@@ -14,6 +14,104 @@ import fcntl
 
 ROOT = Path(__file__).resolve().parents[1]
 
+def check_resources(request, cookie, csrf, resources):
+    devices_path = resources / "DeviceList.json"
+    protocols_path = resources / "ProtocolList.json"
+    stock_command = {"Id-": 40, "Name": "Old", "KeyCode": "original", "Raw": None,
+                     "ProtocolId": 20, "StockExtension": {"keep": [1, "quoted\\\" value"]}}
+    target = {"Device": {"Id-": 12, "Name": "Stock", "Manufacturer": "LG", "Model": "C5",
+                         "DeviceTypeDisplayName": "Television", "StockField": {"keep": True}},
+              "Commands": [stock_command], "DeviceFeatures": [{"keep": True}]}
+    neighbor = {"Device": {"Id-": 123, "Name": "Other", "Manufacturer": "LG", "Model": "Other",
+                           "DeviceTypeDisplayName": "Television"},
+                "Commands": [{"Id-": 400, "Name": "Other"}]}
+    fixture = {"UnknownTopLevel": {"keep": "Device and Commands are not delimiters"}, "DevicesWithFeatures": [neighbor, target]}
+    devices_path.write_text(json.dumps(fixture, indent=2))
+    protocols_path.write_text(json.dumps({"Metadata": {"keep": True}, "Protocols": [{"Id-": 20, "Name": "Other"}]}, indent=2))
+
+    def mutate(path, **body):
+        revision = request("configuration", cookie=cookie)[1]["revision"]
+        return request(path, dict(body, revision=revision), cookie, csrf)
+
+    def saved():
+        return json.loads(devices_path.read_text())
+
+    def command(**values):
+        return mutate("commands/save", deviceId="12", **values)
+
+    result = request("devices", cookie=cookie)[1]
+    assert result["deviceCount"] == 2 and result["totalCommandCount"] == 2
+    assert {item["id"] for item in result["devices"]} == {"12", "123"}
+    assert mutate("devices", action="update", deviceId="12", name="Renamed", manufacturer="LG", model="C5", type="Television")[0] == 200
+    current = saved()
+    assert current["DevicesWithFeatures"][0] == neighbor, "ID 12 must not match 123"
+    assert current["DevicesWithFeatures"][1]["Device"]["StockField"] == {"keep": True}
+    assert current["UnknownTopLevel"] == fixture["UnknownTopLevel"]
+    assert command(oldName="Old", name="Off", mode="nec", protocol="2", nec="20DFA35C")[0] == 200
+    current = saved()
+    updated = current["DevicesWithFeatures"][1]["Commands"][0]
+    assert updated["Id-"] == 40 and updated["StockExtension"] == stock_command["StockExtension"]
+    assert updated["ProtocolId"] == 2
+    protocols = json.loads(protocols_path.read_text())
+    assert sorted(p["Id-"] for p in protocols["Protocols"]) == [2, 20], "protocol 20 must not satisfy protocol 2"
+    assert protocols["Metadata"] == {"keep": True}
+    assert command(name="Off", mode="raw", raw="F9470P100S100P100S100")[0] == 400
+    assert mutate("commands/import", deviceId="12", payload="Off|raw|F9470P100S100P100S100\nNew|raw|F9470P100S100P100S100\nNew|raw|F9470P100S100P100S100")[0] == 200
+    commands = saved()["DevicesWithFeatures"][1]["Commands"]
+    assert [c["Name"] for c in commands] == ["Off", "New"]
+    assert commands[1]["Id-"] > 400
+    before = devices_path.read_bytes()
+    assert command(oldName="Off", name="New", mode="nec", nec="20DF10EF")[0] == 400
+    assert devices_path.read_bytes() == before
+    assert command(action="delete", name="Off")[0] == 200
+    assert [c["Name"] for c in saved()["DevicesWithFeatures"][1]["Commands"]] == ["New"]
+
+    # Escapes, whitespace, reordered fields and unknown nested values survive a rewrite.
+    current = saved()
+    current["DevicesWithFeatures"][1]["Commands"][0]["Name"] = 'Quoted "name" \\ path'
+    current["DevicesWithFeatures"][1]["Commands"][0]["StockExtension"] = {"keep": [1, 2]}
+    devices_path.write_text(json.dumps(current, indent=4, sort_keys=True))
+    inventory = request("devices", cookie=cookie)[1]
+    assert inventory["devices"][1]["commands"][0]["name"] == 'Quoted "name" \\ path'
+    assert mutate("devices", action="update", deviceId="12", name="TV", manufacturer="LG", model="C5", type="Television")[0] == 200
+    assert saved()["DevicesWithFeatures"][1]["Commands"] == current["DevicesWithFeatures"][1]["Commands"]
+
+    # Invalid resource files are rejected without silently starting a replacement configuration.
+    for invalid in ['{"DevicesWithFeatures":[],"DevicesWithFeatures":[]}', '{"DevicesWithFeatures":{}}', '{broken']:
+        devices_path.write_text(invalid)
+        assert request("devices", cookie=cookie)[1]["ok"] is False
+        assert mutate("devices", action="create", transport="ir", name="New", manufacturer="LG", model="C5", type="Television")[0] == 400
+        assert devices_path.read_text() == invalid
+
+    current["DevicesWithFeatures"][1]["Commands"] = [{"Id-": n+1, "Name": f"C{n}"} for n in range(2048)]
+    devices_path.write_text(json.dumps(current))
+    before = devices_path.read_bytes()
+    assert command(name="Too many", mode="raw", raw="F9470P100S100P100S100")[0] == 400
+    assert devices_path.read_bytes() == before
+    # A near-limit file must not grow past the resource budget on write.
+    current["DevicesWithFeatures"][1]["Commands"] = []
+    raw = json.dumps(current)
+    current["Padding"] = "x" * (2 * 1024 * 1024 - len(raw) - 64)
+    devices_path.write_text(json.dumps(current))
+    assert devices_path.stat().st_size < 2 * 1024 * 1024
+    before = devices_path.read_bytes()
+    assert command(name="Too large", mode="raw", raw="F9470P100S100P100S100")[0] == 400
+    assert devices_path.read_bytes() == before
+    devices_path.write_text(json.dumps(fixture))
+    assert mutate("devices", action="delete", deviceId="12")[0] == 200
+    assert saved()["DevicesWithFeatures"] == [neighbor]
+    assert mutate("devices", action="create", transport="bluetooth", name="Keyboard", type="btkeyboard", bdaddr="01:23:45:67:89:AB")[0] == 200
+    bt_id = request("bluetooth/devices", cookie=cookie)[1]["devices"][0]["id"]
+    script = 'TEXT "quoted" \\ path\nKEY ENTER'
+    assert mutate("commands/save", transport="bluetooth", deviceId=bt_id, name="Text", script=script, delayMs=50)[0] == 200
+    bt = request("bluetooth/devices", cookie=cookie)[1]["devices"][0]
+    assert bt["commands"] == [{"name": "Text", "script": script, "delayMs": 50}]
+    assert mutate("devices", action="delete", transport="bluetooth", deviceId=bt_id)[0] == 200
+    assert request("bluetooth/devices", cookie=cookie)[1]["devices"] == []
+    for invalid in [{"action": "connect", "type": "unknown"}, {"action": "connect", "type": "btkeyboard", "bdaddr": "invalid"}]:
+        assert request("bluetooth/pair", invalid, cookie, csrf)[1]["ok"] is False
+    print("Stock resources: exact IDs, JSON formatting/escapes, preserved fields, CRUD/import, malformed files and storage limits passed")
+
 
 def run():
     with tempfile.TemporaryDirectory(prefix="harmony-local-") as directory:
@@ -248,6 +346,7 @@ def run():
             subprocess.run([binary, "--internal-key"], check=True)
             assert json.loads((resources / "DeviceList.json").read_text()) == fixtures["DeviceList"]
             assert not (journal / "pending").exists()
+            check_resources(request, cookie, csrf, resources)
             print("Local API: pairing, approval/revocation, ownership, origin/CSRF, revisions, backups, cancellation, signature/framing validation and crash recovery passed")
         finally:
             for process in (coordinator, server):
