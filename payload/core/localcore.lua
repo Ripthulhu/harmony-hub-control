@@ -6,6 +6,16 @@ local started = false
 local ROOT = "/tmp/harmony-operations/"
 local RELOAD = "/data/codex/reload_resources"
 
+-- Activity waits must yield through the stock Lua 5.1 scheduler.
+local function protected(fn, ...)
+  local thread = coroutine.create(fn)
+  local values = {coroutine.resume(thread, ...)}
+  while values[1] and coroutine.status(thread) ~= "dead" do
+    values = {coroutine.resume(thread, coroutine.yield(unpack(values, 2)))}
+  end
+  return unpack(values)
+end
+
 local function read(path)
   local f = io.open(path, "r")
   if not f then return nil end
@@ -175,6 +185,7 @@ function M.runActivity(op, previous)
 end
 local function activities()
   local previous = nil
+  write(ROOT .. "activity-state.json", {activityId = "", estimated = true})
   local current = read(ROOT .. "activity-current")
   if id(current) then
     local interrupted = decode(ROOT .. current .. ".json")
@@ -190,7 +201,7 @@ local function activities()
       local op = decode(ROOT .. current .. ".json")
       if op and op.kind == "activity" and op.state == "queued" then
         op.state = "running"; write(ROOT .. current .. ".json", op)
-        local called, ok, err = pcall(M.runActivity, op, previous)
+        local called, ok, err = protected(M.runActivity, op, previous)
         if not called then err = tostring(ok); ok = nil end
         op.state = ok and "completed" or err == "cancelled" and "cancelled" or "failed"
         op.result = {ok = ok and true or false, error = err, stateEstimated = true}

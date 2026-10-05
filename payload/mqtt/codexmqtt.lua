@@ -3,173 +3,87 @@ module(..., package.seeall)
 local socket = require("socket")
 local system = require("system")
 local json = require("json")
-local log = require("log").logger("auto.p.codexmqtt")
-
 local localcore = require("tasks.codex.localcore")
-local session = require("tasks.harmonywebservices.core.session")
-local digest = require("tasks.harmonywebservices.core.statedigest"):instance()
+local CONFIG = "/data/codexmqtt/config.json"
+local MANIFEST = "/data/codexmqtt/discovery.json"
+local STATUS = "/tmp/harmony-operations/mqtt-status.json"
+local mqttTask, moduleObj, writeError
+local stopRequested, packetId = false, 0
+local pending = {}
 
-local CONFIG_FILE = "/data/codexmqtt/config.json"
-local IR_EVENT_LOG = "/data/codex/ir-events.log"
-local DEFAULT_BASE_TOPIC = "harmony/hub"
-local DEFAULT_DISCOVERY_PREFIX = "homeassistant"
-local DEFAULT_CLIENT_ID = "harmony-codexmqtt"
-local DEFAULT_KEEPALIVE = 60
-local DEFAULT_DUPLICATE_WINDOW_MS = 3000
-local IR_EVENT_MAX_BYTES = 65536
-
-local moduleObj
-local mqttTask
-local stopRequested = false
-local stateCache = ""
-local pktid = 1
-local recentCommandKey = nil
-local recentCommandAt = 0
-local pendingOperations = {}
-
-local function new(self)
-  local obj = {}
-  setmetatable(obj, self)
-  self.__index = self
-  return obj
-end
-
-function instance(self)
-  if not moduleObj then
-    moduleObj = new(self)
+-- Lua 5.1 cannot yield through pcall/xpcall. Forward the scheduler's yields
+-- while containing a failed integration task, without logging its credentials.
+local function protected(fn, ...)
+  local thread = coroutine.create(fn)
+  local values = {coroutine.resume(thread, ...)}
+  while values[1] and coroutine.status(thread) ~= "dead" do
+    values = {coroutine.resume(thread, coroutine.yield(unpack(values, 2)))}
   end
-  return moduleObj
+  return unpack(values)
 end
 
-local function readFile(path)
+local function read(path)
   local f = io.open(path, "r")
-  if not f then
-    return nil
-  end
-  local data = f:read("*a")
-  f:close()
-  return data
+  if not f then return nil end
+  local raw = f:read("*a"); f:close(); return raw
 end
-
+local function decode(raw)
+  local ok, value = pcall(json.decode, raw or "")
+  return ok and type(value) == "table" and value or nil
+end
+local function write(path, value)
+  local raw = json.encode(value)
+  if path == MANIFEST and os.execute("/data/codex/bin/codex_webui --space /data " .. tostring(#raw * 2) .. " >/dev/null 2>&1") ~= 0 then return nil end
+  local f = io.open(path .. ".new", "w")
+  if not f then return nil end
+  local ok = f:write(raw); f:close()
+  if not ok then return nil end
+  return os.rename(path .. ".new", path)
+end
+local function runtime(state, err)
+  write(STATUS, {state = state, error = err, updatedAt = os.time()})
+end
 local function readConfig()
-  local data = readFile(CONFIG_FILE)
-  if not data then
-    return {enabled = false}
+  local raw = read(CONFIG)
+  local cfg = decode(raw) or {enabled = false}
+  cfg.broker = type(cfg.broker) == "table" and cfg.broker or {}
+  cfg.baseTopic = cfg.baseTopic or "harmony/hub"
+  cfg.discoveryPrefix = cfg.discoveryPrefix or "homeassistant"
+  cfg.clientId = cfg.clientId or "harmony-codexmqtt"
+  cfg.name = cfg.name or "Harmony Hub"
+  cfg.keepAlive = math.max(10, math.min(300, tonumber(cfg.keepAlive) or 60))
+  cfg.pollSeconds = math.max(2, math.min(60, tonumber(cfg.pollSeconds) or 10))
+  cfg.haDiscovery = cfg.haDiscovery ~= false
+  cfg.raw = raw
+  for _, key in ipairs({"baseTopic", "discoveryPrefix", "clientId"}) do
+    if type(cfg[key]) ~= "string" or #cfg[key] == 0 or #cfg[key] > 128 or cfg[key]:find("[%z+#]") then cfg.enabled = false end
   end
-  local ok, cfg = system.safeCall(json.decode, data)
-  if not ok or type(cfg) ~= "table" then
-    log.notice("invalid codexmqtt config")
-    return {enabled = false}
-  end
-  cfg.broker = cfg.broker or {}
-  cfg.baseTopic = cfg.baseTopic or DEFAULT_BASE_TOPIC
-  cfg.discoveryPrefix = cfg.discoveryPrefix or DEFAULT_DISCOVERY_PREFIX
-  cfg.clientId = cfg.clientId or DEFAULT_CLIENT_ID
-  cfg.keepAlive = tonumber(cfg.keepAlive) or DEFAULT_KEEPALIVE
-  cfg.pollSeconds = tonumber(cfg.pollSeconds) or 10
-  cfg.duplicateWindowMs = tonumber(cfg.duplicateWindowMs) or DEFAULT_DUPLICATE_WINDOW_MS
-  if cfg.duplicateWindowMs < 0 then
-    cfg.duplicateWindowMs = 0
-  elseif cfg.duplicateWindowMs > 60000 then
-    cfg.duplicateWindowMs = 60000
-  end
-  cfg.name = cfg.name or system.getHostName() or "Harmony Hub"
-  if cfg.haDiscovery == nil then
-    cfg.haDiscovery = true
-  end
-  cfg.__raw = data
   return cfg
 end
-
-local function u16(n)
-  return string.char(math.floor(n / 256) % 256, n % 256)
-end
-
-local function utf(s)
-  s = tostring(s or "")
-  return u16(#s) .. s
-end
-
-local function remLen(n)
-  local out = ""
-  repeat
-    local digit = n % 128
-    n = math.floor(n / 128)
-    if n > 0 then
-      digit = digit + 128
-    end
-    out = out .. string.char(digit)
-  until n == 0
-  return out
-end
-
+local function u16(n) return string.char(math.floor(n / 256) % 256, n % 256) end
+local function utf(s) return u16(#s) .. s end
 local function packet(kind, body)
-  return string.char(kind) .. remLen(#body) .. body
+  local n, bytes = #body, {}
+  repeat
+    local digit = n % 128; n = math.floor(n / 128)
+    bytes[#bytes + 1] = string.char(digit + (n > 0 and 128 or 0))
+  until n == 0
+  return string.char(kind) .. table.concat(bytes) .. body
 end
 
-local function nextPktid()
-  pktid = pktid + 1
-  if pktid > 65535 then
-    pktid = 1
+-- LuaSocket returns the last byte index, including for a partial write.
+local function sendAll(sock, raw)
+  if writeError then return nil, writeError end
+  local pos = 1
+  for _ = 1, 80 do
+    local sent, err, partial = sock:send(raw, pos)
+    pos = (sent or partial or (pos - 1)) + 1
+    if pos > #raw then return true end
+    if err ~= "timeout" then writeError = err or "short write"; return nil, writeError end
+    system.sleep(25)
   end
-  return pktid
+  writeError = "MQTT write timed out"; return nil, writeError
 end
-
-local function nowMillis()
-  local ok, value = system.safeCall(function()
-    return system.jiffies():tomillis()
-  end)
-  if ok and value then
-    return tonumber(value) or 0
-  end
-  return (tonumber(os.time()) or 0) * 1000
-end
-
-local function appendIrEvent(event, fields)
-  local row = fields or {}
-  row.event = event
-  row.ts = tonumber(os.time()) or 0
-  local ok, encoded = system.safeCall(json.encode, row)
-  if not ok or not encoded then
-    return
-  end
-  local existing = io.open(IR_EVENT_LOG, "r")
-  if existing then
-    local size = existing:seek("end") or 0
-    existing:close()
-    if size > IR_EVENT_MAX_BYTES then
-      os.remove(IR_EVENT_LOG .. ".1")
-      os.rename(IR_EVENT_LOG, IR_EVENT_LOG .. ".1")
-    end
-  end
-  local f = io.open(IR_EVENT_LOG, "a")
-  if not f then
-    return
-  end
-  f:write(encoded, "\n")
-  f:close()
-end
-
-local function holdActionDetails(params)
-  if type(params) ~= "table" then
-    return {}
-  end
-  local details = {
-    status = tostring(params.status or ""),
-    count = tostring(params.count or ""),
-    delayInMs = tostring(params.delayInMs or "")
-  }
-  if type(params.action) == "string" then
-    local ok, action = system.safeCall(json.decode, params.action)
-    if ok and type(action) == "table" then
-      details.deviceId = tostring(action.deviceId or "")
-      details.command = tostring(action.command or "")
-      details.type = tostring(action.type or "")
-    end
-  end
-  return details
-end
-
 local function recvBytes(sock, n, idle)
   local chunks, got = {}, 0
   for _ = 1, 40 do
@@ -183,65 +97,40 @@ local function recvBytes(sock, n, idle)
   end
   return nil, "incomplete packet"
 end
-
 local function recvPacket(sock)
   local h, err = recvBytes(sock, 1, true)
-  if not h then
-    return nil, err
-  end
-  local multiplier = 1
-  local length = 0
+  if not h then return nil, err end
+  local multiplier, length = 1, 0
   for i = 1, 4 do
-    local b
-    b, err = recvBytes(sock, 1)
-    if not b then
-      return nil, err == "timeout" and "incomplete packet" or err
-    end
-    local byte = string.byte(b, 1)
-    length = length + (byte % 128) * multiplier
+    local b; b, err = recvBytes(sock, 1)
+    if not b then return nil, err == "timeout" and "incomplete packet" or err end
+    local byte = b:byte()
+    length = length + byte % 128 * multiplier
     if length > 65536 then return nil, "packet too large" end
-    if byte < 128 then
-      break
-    end
+    if byte < 128 then break end
     if i == 4 then return nil, "invalid packet length" end
     multiplier = multiplier * 128
   end
   local body = ""
   if length > 0 then
     body, err = recvBytes(sock, length)
-    if not body or #body ~= length then
-      return nil, err == "timeout" and "incomplete packet" or (err or "short read")
-    end
+    if not body then return nil, err == "timeout" and "incomplete packet" or err end
   end
-  return {kind = math.floor(string.byte(h, 1) / 16), flags = string.byte(h, 1) % 16, body = body}
+  return {kind = math.floor(h:byte() / 16), flags = h:byte() % 16, body = body}
 end
-
 local function publish(sock, topic, payload, retain)
-  payload = tostring(payload or "")
-  local fixed = retain and 0x31 or 0x30
-  return sock:send(packet(fixed, utf(topic) .. payload))
+  return sendAll(sock, packet(retain and 0x31 or 0x30, utf(topic) .. payload))
 end
-
-local function subscribe(sock, topics)
-  local id = nextPktid()
-  local body = u16(id)
-  for _, topic in ipairs(topics) do
-    body = body .. utf(topic) .. string.char(0)
-  end
-  return sock:send(packet(0x82, body))
-end
-
 local function connectMqtt(cfg)
-  local host = cfg.broker.host
-  local port = tonumber(cfg.broker.port) or 1883
+  writeError = nil
   local sock, err = socket.tcp()
-  if not sock then
-    return nil, err
+  if not sock then return nil, err end
+  local host = cfg.broker.host
+  if type(host) ~= "string" or not host:match("^%d+%.%d+%.%d+%.%d+$") then
+    sock:close(); return nil, "Enter the broker IPv4 address"
   end
-  if not host:match("^%d+%.%d+%.%d+%.%d+$") then sock:close(); return nil, "Use the broker IPv4 address to avoid blocking the local engine on DNS" end
   sock:settimeout(0)
-  local ok
-  ok, err = sock:connect(host, port)
+  local ok; ok, err = sock:connect(host, tonumber(cfg.broker.port) or 1883)
   if not ok and err == "timeout" then
     for _ = 1, 80 do
       system.sleep(25)
@@ -249,444 +138,261 @@ local function connectMqtt(cfg)
     end
   end
   if not ok then sock:close(); return nil, err end
-
-  local flags = 0x02 + 0x04 + 0x20
+  local flags = 0x26 -- Clean session; retained offline will.
   local payload = utf(cfg.clientId) .. utf(cfg.baseTopic .. "/status") .. utf("offline")
-  if cfg.broker.username and cfg.broker.username ~= "" then
-    flags = flags + 0x80
-    if cfg.broker.password and cfg.broker.password ~= "" then
-      flags = flags + 0x40
-    end
+  if type(cfg.broker.username) == "string" and cfg.broker.username ~= "" then
+    flags = flags + 0x80; payload = payload .. utf(cfg.broker.username)
+    if type(cfg.broker.password) == "string" then flags = flags + 0x40; payload = payload .. utf(cfg.broker.password) end
   end
-  if cfg.broker.username and cfg.broker.username ~= "" then
-    payload = payload .. utf(cfg.broker.username)
-    if cfg.broker.password and cfg.broker.password ~= "" then
-      payload = payload .. utf(cfg.broker.password)
+  ok, err = sendAll(sock, packet(0x10, utf("MQTT") .. string.char(4, flags) .. u16(cfg.keepAlive) .. payload))
+  if not ok then sock:close(); return nil, err end
+  for _ = 1, 80 do
+    local ack; ack, err = recvPacket(sock)
+    if ack then
+      if ack.kind == 2 and ack.flags == 0 and ack.body == "\0\0" then return sock end
+      sock:close(); return nil, "Broker refused MQTT connection"
     end
-  end
-
-  local vh = utf("MQTT") .. string.char(4, flags) .. u16(cfg.keepAlive)
-  sock:send(packet(0x10, vh .. payload))
-  local ack
-  for _ = 1, 40 do
-    ack, err = recvPacket(sock)
-    if ack or err ~= "timeout" then break end
+    if err ~= "timeout" then break end
     system.sleep(25)
   end
-  if not ack or ack.kind ~= 2 or #ack.body ~= 2 or string.byte(ack.body, 2) ~= 0 then
-    sock:close()
-    return nil, err or "CONNACK failed"
+  sock:close(); return nil, err or "CONNACK timed out"
+end
+local function safeId(s) return (s:lower():gsub("[^%w_%-]+", "_"):gsub("_+", "_")) end
+local function hex(s) return (tostring(s):gsub(".", function(c) return string.format("%02x", c:byte()) end)) end
+local function activities()
+  local config = decode(read("/data/codex/local/config.json")) or {}
+  return type(config.activities) == "table" and config.activities or {}
+end
+local function activityLabel(a) return a.name .. " (" .. a.id .. ")" end
+local function findActivity(value)
+  value = tostring(value)
+  if value == "PowerOff" or value == "-1" or value == "power-off" then return "-1" end
+  local found
+  for _, a in ipairs(activities()) do
+    if value == a.id or value == activityLabel(a) then return a.id end
+    if value == a.name then if found then return nil end; found = a.id end
   end
-  sock:settimeout(0)
-  return sock
+  return found
 end
-
-local function safeId(s)
-  s = tostring(s or "harmony_hub")
-  s = string.lower(s)
-  s = string.gsub(s, "[^%w_%-]+", "_")
-  s = string.gsub(s, "_+", "_")
-  return s
-end
-
-local function localActivities()
-  local ok, config = pcall(json.decode, readFile("/data/codex/local/config.json") or "")
-  return ok and config.activities or {}
-end
-
-local function activityName(account, id)
-  if tostring(id) == "-1" then return "PowerOff" end
-  for _, act in ipairs(localActivities()) do if act.id == tostring(id) then return act.name end end
-  return tostring(id or "unknown")
-end
-
-local function activityOptions(account)
-  local opts = {"PowerOff"}
-  for _, act in ipairs(localActivities()) do opts[#opts + 1] = act.name end
-  return opts
-end
-
-local function inventoryCounts(account)
-  local devices = 0
-  local commands = 0
-  if account and account.devices then
-    for _, device in pairs(account.devices) do
-      devices = devices + 1
-      if device.commands then
-        for _, _ in pairs(device.commands) do
-          commands = commands + 1
-        end
-      end
-    end
-  end
-  return devices, commands
-end
-
-local function findActivity(account, nameOrId)
-  local value = tostring(nameOrId or "")
-  if value == "-1" or string.lower(value) == "off" or value == "PowerOff" then return "-1" end
-  for _, act in ipairs(localActivities()) do if act.id == value or act.name == value then return act.id end end
-  return nil
-end
-
-local function callEngine(cmd, params)
-  return nil, "Raw HBus calls are disabled; use the local command API"
-end
-
-local function startActivity(activityId)
-  return localcore.request("/api/v1/activities/run", {activityId = tostring(activityId)})
-end
-
-local function sendCommand(cmd)
-  return localcore.command(cmd)
-end
-
-local function statePayload(cfg)
-  local account = session.getAccount()
-  local _, localState = pcall(json.decode, readFile("/tmp/harmony-operations/activity-state.json") or "")
-  local id = type(localState) == "table" and localState.activityId or "-1"
-  local deviceCount, commandCount = inventoryCounts(account)
+local function statePayload(cfg, inventory)
+  local state = decode(read("/tmp/harmony-operations/activity-state.json")) or {}
+  local id, label = state.activityId or "", ""
+  if id == "-1" or id == "power-off" then label = "PowerOff"
+  else for _, a in ipairs(activities()) do if a.id == id then label = activityLabel(a) end end end
   local ip = system.getNetworkAttribute("ipaddr")
-  local payload = {
-    activityId = tostring(id or "-1"),
-    activity = activityName(account, id),
-    activityStatus = 0,
-    stateEstimated = true,
-    stateVersion = digest.stateVersion or 0,
-    firmware = system.getFirmwareVersion(),
-    ip = ip,
-    hostname = system.getHostName(),
-    webui = ip and ("http://" .. tostring(ip) .. ":8080/") or "",
-    mqttClientId = cfg.clientId,
-    baseTopic = cfg.baseTopic,
-    discoveryPrefix = cfg.discoveryPrefix,
-    deviceCount = deviceCount,
-    commandCount = commandCount
-  }
-  return json.encode(payload)
+  return json.encode({activityId = id, activity = label, stateEstimated = true,
+    firmware = system.getFirmwareVersion(), ip = ip, hostname = system.getHostName(),
+    webui = "http://" .. tostring(ip) .. ":8080/", mqttClientId = cfg.clientId,
+    deviceCount = inventory.deviceCount, commandCount = inventory.totalCommandCount})
 end
-
-local function publishState(sock, cfg, force)
-  local payload = statePayload(cfg)
-  if force or payload ~= stateCache then
-    stateCache = payload
-    publish(sock, cfg.baseTopic .. "/state", payload, true)
-  end
-end
-
-local function publishDiscovery(sock, cfg)
-  if not cfg.haDiscovery then
-    return
-  end
-  local account = session.getAccount()
-  local ident = safeId(cfg.clientId)
-  local base = cfg.baseTopic
+local function discovery(cfg, inventory)
+  local out, ident = {}, safeId(cfg.clientId)
+  if not cfg.haDiscovery then return out end
   local ip = system.getNetworkAttribute("ipaddr")
-  local dev = {
-    identifiers = {ident},
-    name = cfg.name,
-    manufacturer = "Logitech",
-    model = "Harmony Hub",
-    sw_version = system.getFirmwareVersion(),
-    configuration_url = ip and ("http://" .. tostring(ip) .. ":8080/") or nil
-  }
-  local origin = {
-    name = "codexmqtt",
-    sw_version = "0.3",
-    support_url = "http://" .. tostring(ip or "harmony-hub.local") .. ":8080/"
-  }
-  local availability = base .. "/status"
-
-  local selectPayload = {
-    name = "Activity",
-    unique_id = ident .. "_activity",
-    command_topic = base .. "/activity/set",
-    state_topic = base .. "/state",
-    value_template = "{{ value_json.activity }}",
-    json_attributes_topic = base .. "/state",
-    options = activityOptions(account),
-    availability_topic = availability,
-    payload_available = "online",
-    payload_not_available = "offline",
-    icon = "mdi:remote-tv",
-    origin = origin,
-    device = dev
-  }
-  publish(sock, cfg.discoveryPrefix .. "/select/" .. ident .. "_activity/config", json.encode(selectPayload), true)
-
-  local sensors = {
-    {"activity_id", "Activity ID", "activityId", "mdi:identifier"},
-    {"ip", "IP Address", "ip", "mdi:ip-network"},
-    {"firmware", "Firmware", "firmware", "mdi:chip"},
-    {"ir_devices", "IR Devices", "deviceCount", "mdi:remote"},
-    {"ir_commands", "IR Commands", "commandCount", "mdi:counter"}
-  }
-  for _, sensor in ipairs(sensors) do
-    local payload = {
-      name = sensor[2],
-      unique_id = ident .. "_" .. sensor[1],
-      state_topic = base .. "/state",
-      value_template = "{{ value_json." .. sensor[3] .. " }}",
-      json_attributes_topic = sensor[1] == "ip" and (base .. "/state") or nil,
-      availability_topic = availability,
-      payload_available = "online",
-      payload_not_available = "offline",
-      icon = sensor[4],
-      entity_category = "diagnostic",
-      origin = origin,
-      device = {identifiers = {ident}}
-    }
-    publish(sock, cfg.discoveryPrefix .. "/sensor/" .. ident .. "_" .. sensor[1] .. "/config", json.encode(payload), true)
+  local hub = {identifiers = {ident}, name = cfg.name, manufacturer = "Logitech", model = "Harmony Hub",
+    sw_version = system.getFirmwareVersion(), configuration_url = "http://" .. tostring(ip) .. ":8080/"}
+  local function add(component, id, payload, device)
+    payload.unique_id = id
+    payload.device = device or hub
+    payload.origin = {name = "Harmony Local", sw_version = "1.0.0"}
+    payload.availability_topic = cfg.baseTopic .. "/status"
+    out[cfg.discoveryPrefix .. "/" .. component .. "/" .. id .. "/config"] = json.encode(payload)
   end
-
-  local offPayload = {
-    name = "Power Off",
-    unique_id = ident .. "_power_off",
-    command_topic = base .. "/activity/set",
-    payload_press = "PowerOff",
-    availability_topic = availability,
-    payload_available = "online",
-    payload_not_available = "offline",
-    icon = "mdi:power",
-    origin = origin,
-    device = {identifiers = {ident}}
-  }
-  publish(sock, cfg.discoveryPrefix .. "/button/" .. ident .. "_power_off/config", json.encode(offPayload), true)
-end
-
-local function publishResult(sock, cfg, payload)
-  if payload.operation and payload.operation.id then
-    pendingOperations[payload.operation.id] = os.time()
+  local options = {"PowerOff"}
+  for _, a in ipairs(activities()) do options[#options + 1] = activityLabel(a) end
+  add("select", ident .. "_activity", {name = "Activity", options = options,
+    command_topic = cfg.baseTopic .. "/activity/set", state_topic = cfg.baseTopic .. "/state",
+    value_template = "{{ value_json.activity or 'None' }}", icon = "mdi:remote-tv"})
+  add("button", ident .. "_power_off", {name = "Stop activity", payload_press = "PowerOff",
+    command_topic = cfg.baseTopic .. "/activity/set", icon = "mdi:power"})
+  for _, s in ipairs({{"activity_id", "Activity ID", "activityId", "mdi:identifier"},
+    {"ip", "IP Address", "ip", "mdi:ip-network"}, {"firmware", "Firmware", "firmware", "mdi:chip"},
+    {"ir_devices", "IR Devices", "deviceCount", "mdi:remote"}, {"ir_commands", "IR Commands", "commandCount", "mdi:counter"}}) do
+    add("sensor", ident .. "_" .. s[1], {name = s[2], state_topic = cfg.baseTopic .. "/state",
+      value_template = "{{ value_json." .. s[3] .. " }}", icon = s[4], entity_category = "diagnostic"})
   end
-  publish(sock, cfg.baseTopic .. "/result", json.encode(payload), false)
-end
-
-local function publishOperations(sock, cfg)
-  for id, created in pairs(pendingOperations) do
-    local ok, operation = pcall(json.decode, readFile("/tmp/harmony-operations/" .. id .. ".json") or "")
-    if ok and type(operation) == "table" and (operation.state == "completed" or operation.state == "failed" or operation.state == "cancelled") then
-      publish(sock, cfg.baseTopic .. "/result", json.encode({operationId = id, state = operation.state, result = operation.result}), false)
-      pendingOperations[id] = nil
-    elseif os.time() - created > 180 then
-      publish(sock, cfg.baseTopic .. "/result", json.encode({operationId = id, state = "unknown", error = "Operation history expired"}), false)
-      pendingOperations[id] = nil
+  local common = {power=true, powertoggle=true, poweron=true, poweroff=true, volumeup=true, volumedown=true,
+    volup=true, voldown=true, mute=true, input=true, play=true, pause=true, stop=true, up=true, down=true,
+    left=true, right=true, ok=true, select=true, home=true, back=true}
+  for _, d in ipairs(inventory.devices or {}) do
+    local id = ident .. "_device_" .. hex(d.id)
+    local device = {identifiers = {id}, name = d.name, manufacturer = d.manufacturer, model = d.model, via_device = ident}
+    for _, c in ipairs(d.commands or {}) do
+      add("button", id .. "_" .. hex(c.name), {name = c.name, icon = "mdi:remote",
+        command_topic = cfg.baseTopic .. "/command", payload_press = json.encode({deviceId = d.id, command = c.name}),
+        enabled_by_default = common[c.name:lower():gsub("[^%w]", "")] == true}, device)
     end
   end
+  return out
 end
-
-local function handleActivity(sock, cfg, payload)
-  log.notice("codexmqtt activity request", tostring(payload or ""))
-  local account = session.getAccount()
-  local activityId = findActivity(account, payload)
-  if not activityId then
-    publishResult(sock, cfg, {ok = false, error = "unknown activity", value = payload})
-    return
-  end
-  local reply, err = startActivity(activityId)
-  publishResult(sock, cfg, {ok = reply ~= nil, cmd = "startactivity", activityId = activityId, operation = reply, error = err})
-end
-
-local function handleCommand(sock, cfg, payload, topic)
-  local ok, decoded = system.safeCall(json.decode, payload)
-  if ok and type(decoded) == "table" then
-    if decoded.cmd then
-      log.notice("codexmqtt hbus command", tostring(decoded.cmd), "topic", tostring(topic or ""))
-      local reply, err = callEngine(decoded.cmd, decoded.params or {})
-      if tostring(decoded.cmd) == "harmony.engine?holdaction" then
-        local details = holdActionDetails(decoded.params)
-        details.source = "mqtt-hbus"
-        details.topic = tostring(topic or "")
-        details.reply = tostring(reply or "")
-        appendIrEvent("ir_send", details)
-      end
-      publishResult(sock, cfg, {ok = reply ~= nil, cmd = decoded.cmd, reply = reply, error = err})
-    elseif decoded.activity or decoded.activityId then
-      handleActivity(sock, cfg, decoded.activityId or decoded.activity)
-    elseif decoded.deviceId and decoded.command then
-      log.notice("codexmqtt ir command", "device", tostring(decoded.deviceId), "command", tostring(decoded.command), "topic", tostring(topic or ""))
-      local reply, err = sendCommand(decoded)
-      appendIrEvent("ir_send", {
-        source = "mqtt",
-        topic = tostring(topic or ""),
-        deviceId = tostring(decoded.deviceId or ""),
-        command = tostring(decoded.command or ""),
-        status = tostring(decoded.status or "pressrelease"),
-        count = tostring(decoded.count or 1),
-        delayInMs = tostring(decoded.delayInMs or ""),
-        reply = tostring(reply or "")
-      })
-      publishResult(sock, cfg, {ok = reply ~= nil, cmd = "command", operation = reply, error = err})
-    else
-      publishResult(sock, cfg, {ok = false, error = "unknown command shape"})
+local function publishDiscovery(sock, cfg, inventory, previous, force, owner)
+  local desired = discovery(cfg, inventory)
+  if owner then
+    local union, changed = {}, false
+    for t in pairs(previous) do union[t] = true; if not desired[t] then changed = true end end
+    for t in pairs(desired) do union[t] = true; if not previous[t] then changed = true end end
+    if changed then
+      local names = {}; for t in pairs(union) do names[#names + 1] = t end
+      -- Remember new topics before publishing: a crash must not leave undiscoverable orphans.
+      if not write(MANIFEST, {owner = owner, topics = names}) then writeError = "Cannot save discovery manifest"; return nil end
     end
-    return
   end
-
-  local activity = string.match(payload or "", "^activity:(.+)$")
+  for topic in pairs(previous or {}) do if not desired[topic] then publish(sock, topic, "", true) end end
+  for topic, payload in pairs(desired) do
+    if force or not previous or previous[topic] ~= payload then publish(sock, topic, payload, true) end
+  end
+  return desired
+end
+local function result(sock, cfg, payload)
+  if payload.operation and payload.operation.id then pending[payload.operation.id] = os.time() end
+  return publish(sock, cfg.baseTopic .. "/result", json.encode(payload), false)
+end
+local function handlePublish(sock, cfg, pkt, ready)
+  local body, qos = pkt.body, math.floor(pkt.flags / 2) % 4
+  if #body < 2 or qos ~= 0 then return nil, "Unexpected MQTT PUBLISH (QoS 0 required)" end
+  local n = body:byte(1) * 256 + body:byte(2)
+  if n == 0 or n > #body - 2 then return nil, "Invalid MQTT topic" end
+  local topic, payload = body:sub(3, n + 2), body:sub(n + 3)
+  if topic == cfg.discoveryPrefix .. "/status" then return payload == "online" and "discover" or true end
+  if topic ~= cfg.baseTopic .. "/activity/set" and topic ~= cfg.baseTopic .. "/command" and topic ~= cfg.baseTopic .. "/hbus" then return true end
+  if pkt.flags % 2 == 1 then return true end -- Never replay a retained physical command.
+  if not ready then result(sock, cfg, {ok = false, error = "Local service is not ready"}); return true end
+  if #payload > 2048 then result(sock, cfg, {ok = false, error = "Command exceeds 2048 bytes"}); return true end
+  local count = 0; for _ in pairs(pending) do count = count + 1 end
+  if count >= 32 then result(sock, cfg, {ok = false, error = "Too many outstanding operations"}); return true end
+  local command = decode(payload)
+  if topic == cfg.baseTopic .. "/hbus" or (command and command.cmd) then
+    result(sock, cfg, {ok = false, error = "Raw HBus commands are disabled"}); return true
+  end
+  local activity = topic == cfg.baseTopic .. "/activity/set" and payload or command and (command.activityId or command.activity)
+  local op, err
   if activity then
-    handleActivity(sock, cfg, activity)
-    return
-  end
-  publishResult(sock, cfg, {ok = false, error = "payload must be JSON or activity:<name>"})
+    local id = findActivity(activity)
+    if id then op, err = localcore.request("/api/v1/activities/run", {activityId = id})
+    else err = "Unknown or ambiguous local activity" end
+  elseif command and type(command.command) == "string" and (type(command.deviceId) == "string" or type(command.deviceId) == "number") then
+    if command.mode and command.mode ~= "tap" then err = "MQTT supports taps; use the paired API for holds"
+    else op, err = localcore.command(command) end
+  else err = "Expected deviceId and command, or activityId" end
+  result(sock, cfg, {ok = op ~= nil, operation = op, error = err})
+  return true
 end
-
-local function handlePublish(sock, cfg, pkt)
-  local body = pkt.body
-  if #body < 2 then
-    return
-  end
-  local topicLen = string.byte(body, 1) * 256 + string.byte(body, 2)
-  local topic = string.sub(body, 3, 2 + topicLen)
-  local pos = 3 + topicLen
-  local qos = math.floor(pkt.flags / 2) % 4
-  if qos > 0 then
-    pos = pos + 2
-  end
-  local payload = string.sub(body, pos)
-  local retain = (pkt.flags % 2) == 1
-  local isCommandTopic = topic == cfg.baseTopic .. "/activity/set" or topic == cfg.baseTopic .. "/command" or topic == cfg.baseTopic .. "/hbus"
-
-  if retain and isCommandTopic then
-    log.notice("codexmqtt ignored retained command", tostring(topic))
-    appendIrEvent("ir_ignored", {source = "mqtt", reason = "retained command", topic = tostring(topic or "")})
-    publishResult(sock, cfg, {ok = false, ignored = true, reason = "retained command", topic = topic})
-    return
-  end
-
-  if isCommandTopic then
-    local key = topic .. "\n" .. tostring(payload or "")
-    local now = nowMillis()
-    if cfg.duplicateWindowMs > 0 and recentCommandKey == key and now >= recentCommandAt and now - recentCommandAt < cfg.duplicateWindowMs then
-      log.notice("codexmqtt ignored duplicate command", tostring(topic))
-      appendIrEvent("ir_ignored", {source = "mqtt", reason = "duplicate command", topic = tostring(topic or ""), windowMs = tostring(cfg.duplicateWindowMs)})
-      publishResult(sock, cfg, {ok = false, ignored = true, reason = "duplicate command", topic = topic})
-      return
+local function publishOperations(sock, cfg)
+  for id, created in pairs(pending) do
+    local op = decode(read("/tmp/harmony-operations/" .. id .. ".json"))
+    if op and (op.state == "completed" or op.state == "failed" or op.state == "cancelled") then
+      if result(sock, cfg, {operationId = id, state = op.state, result = op.result}) then pending[id] = nil end
+    elseif os.time() - created > 180 then
+      if result(sock, cfg, {operationId = id, state = "unknown", error = "Operation history expired"}) then pending[id] = nil end
     end
-    recentCommandKey = key
-    recentCommandAt = now
-  end
-
-  if topic == cfg.baseTopic .. "/activity/set" then
-    handleActivity(sock, cfg, payload)
-  elseif topic == cfg.baseTopic .. "/command" or topic == cfg.baseTopic .. "/hbus" then
-    handleCommand(sock, cfg, payload, topic)
-  elseif topic == cfg.discoveryPrefix .. "/status" and payload == "online" then
-    publishDiscovery(sock, cfg)
-    publishState(sock, cfg, true)
   end
 end
-
+local function runConnection(sock, cfg)
+  packetId = packetId % 65535 + 1
+  local topics = {cfg.baseTopic .. "/command", cfg.baseTopic .. "/activity/set", cfg.baseTopic .. "/hbus", cfg.discoveryPrefix .. "/status"}
+  local body = u16(packetId)
+  for _, topic in ipairs(topics) do body = body .. utf(topic) .. "\0" end
+  sendAll(sock, packet(0x82, body))
+  local started, lastPing, lastPoll = os.time(), os.time(), 0
+  local pingAt, subscribed, ready, force = nil, false, false, true
+  local previous, stateCache = {}, ""
+  local manifest = decode(read(MANIFEST)) or {}
+  -- Only retire discovery that this exact client previously owned on this broker.
+  local owner = cfg.broker.host .. ":" .. tostring(cfg.broker.port or 1883) .. "/" .. cfg.clientId
+  if manifest.owner == owner and type(manifest.topics) == "table" then
+    for _, t in ipairs(manifest.topics) do if type(t) == "string" then previous[t] = true end end
+  end
+  while not stopRequested and not writeError do
+    local pkt, err = recvPacket(sock)
+    if pkt then
+      if pkt.kind == 9 then
+        if pkt.flags ~= 0 or pkt.body ~= u16(packetId) .. string.rep("\0", #topics) then return nil, "Broker refused command subscription" end
+        subscribed = true
+      elseif pkt.kind == 13 then
+        if pkt.flags ~= 0 or #pkt.body ~= 0 then return nil, "Invalid PINGRESP" end
+        pingAt = nil
+      elseif pkt.kind == 3 then
+        local ok; ok, err = handlePublish(sock, cfg, pkt, ready)
+        if not ok then return nil, err end
+        if ok == "discover" then force = true end
+      else return nil, "Unexpected MQTT packet" end
+    elseif err ~= "timeout" then return nil, err end
+    local now = os.time()
+    if not subscribed and now - started > 5 then return nil, "SUBACK timed out" end
+    if pingAt and now - pingAt >= math.floor(cfg.keepAlive / 2) then return nil, "PINGRESP timed out" end
+    if now - lastPing >= math.floor(cfg.keepAlive / 2) and not pingAt then
+      sendAll(sock, packet(0xC0, "")); pingAt, lastPing = now, now
+    end
+    if subscribed and (force or now - lastPoll >= cfg.pollSeconds) then
+      if read(CONFIG) ~= cfg.raw then return true end
+      local inventory, why = localcore.request("/api/v1/devices")
+      if inventory then
+        local nextTopics = publishDiscovery(sock, cfg, inventory, previous, force, owner)
+        if not nextTopics then return nil, writeError end
+        local changed = false
+        for t in pairs(previous) do if not nextTopics[t] then changed = true end end
+        for t in pairs(nextTopics) do if not previous[t] then changed = true end end
+        if not writeError then
+          if changed then
+            local names = {}; for t in pairs(nextTopics) do names[#names + 1] = t end
+            -- Manifest is written only when the topic set changes, not every poll.
+            if not write(MANIFEST, {owner = owner, topics = names}) then return nil, "Cannot save discovery manifest" end
+          end
+          previous = nextTopics
+          local state = statePayload(cfg, inventory)
+          if force or state ~= stateCache then if publish(sock, cfg.baseTopic .. "/state", state, true) then stateCache = state end end
+          if not ready then publish(sock, cfg.baseTopic .. "/status", "online", true) end
+          ready = true; runtime("connected")
+        end
+      else
+        publish(sock, cfg.baseTopic .. "/status", "offline", true)
+        ready = false; runtime("waiting_for_hub", why)
+      end
+      force = false; lastPoll = now
+    end
+    publishOperations(sock, cfg)
+    system.sleep(50)
+  end
+  return not writeError, writeError
+end
 local function mqttLoop()
   while not stopRequested do
     local cfg = readConfig()
-    if not cfg.enabled or not cfg.broker or not cfg.broker.host then
-      log.notice("codexmqtt disabled or missing broker host")
-      system.sleep(5000)
+    if not cfg.enabled then runtime("disabled"); system.sleep(5000)
     else
+      runtime("connecting")
       local sock, err = connectMqtt(cfg)
-      if not sock then
-        log.notice("codexmqtt connect failed:", err)
-        system.sleep(15000)
-      else
-        log.notice("codexmqtt connected to", cfg.broker.host)
-        publish(sock, cfg.baseTopic .. "/status", "online", true)
-        publishDiscovery(sock, cfg)
-        publishState(sock, cfg, true)
-        subscribe(sock, {
-          cfg.baseTopic .. "/activity/set",
-          cfg.baseTopic .. "/command",
-          cfg.baseTopic .. "/hbus",
-          cfg.discoveryPrefix .. "/status"
-        })
-
-        local lastPing = os.time()
-        local lastPoll = 0
-        local lastConfigCheck = 0
-        local cfgRaw = cfg.__raw or ""
-        while not stopRequested do
-          local pkt, perr = recvPacket(sock)
-          if pkt and pkt.kind == 3 then
-            local ok, herr = system.safeCall(handlePublish, sock, cfg, pkt)
-            if not ok then
-              log.notice("codexmqtt publish handler failed:", tostring(herr))
-            end
-          elseif pkt and pkt.kind == 13 then
-          elseif pkt then
-          elseif perr and perr ~= "timeout" then
-            log.notice("codexmqtt receive failed:", perr)
-            break
-          end
-
-          local now = os.time()
-          publishOperations(sock, cfg)
-          if now - lastPoll >= cfg.pollSeconds then
-            publishState(sock, cfg, false)
-            lastPoll = now
-          end
-          if now - lastConfigCheck >= 5 then
-            local nextRaw = readFile(CONFIG_FILE) or ""
-            if nextRaw ~= cfgRaw then
-              log.notice("codexmqtt config changed; reconnecting")
-              break
-            end
-            lastConfigCheck = now
-          end
-          if now - lastPing >= math.floor(cfg.keepAlive / 2) then
-            local ok, serr = sock:send(packet(0xC0, ""))
-            if not ok then
-              log.notice("codexmqtt ping failed:", serr)
-              break
-            end
-            lastPing = now
-          end
-          system.sleep(100)
-        end
-        pcall(function() publish(sock, cfg.baseTopic .. "/status", "offline", true) end)
-        pcall(function() sock:send(packet(0xE0, "")) end)
-        pcall(function() sock:close() end)
-        system.sleep(5000)
+      if sock then
+        local called, ok, why = protected(runConnection, sock, cfg)
+        err = called and why or "MQTT session failed"
+        -- Failed sessions close without DISCONNECT so the broker emits its will.
+        if called and ok and publish(sock, cfg.baseTopic .. "/status", "offline", true) then sendAll(sock, packet(0xE0, "")) end
+        sock:close()
       end
+      runtime("disconnected", err)
+      system.sleep(15000)
     end
   end
   mqttTask = nil
 end
-
 local function start()
   stopRequested = false
   localcore.start()
-  if not mqttTask then
-    mqttTask = system.addTask("codexmqtt", mqttLoop)
-  end
+  if not mqttTask then mqttTask = system.addTask("codexmqtt", mqttLoop) end
   return true
 end
-
+function instance(self)
+  if not moduleObj then moduleObj = setmetatable({}, {__index = self}) end
+  return moduleObj
+end
 function discover(self)
   start()
-  return {
-    ["codex-mqtt"] = {
-      id = "codex-mqtt",
-      type = "codexmqtt",
-      name = "Codex MQTT Bridge"
-    }
-  }
+  return {["codex-mqtt"] = {id = "codex-mqtt", type = "codexmqtt", name = "Harmony MQTT"}}
 end
-
-function pair(self, gatewayId, gateway)
-  return start()
-end
-
+function pair(self) return start() end
 function monitor(self)
   start()
-  while not stopRequested do
-    system.sleep(60000)
-  end
+  while not stopRequested do system.sleep(60000) end
 end
-
-function status(self)
-  return {state = mqttTask and "running" or "stopped", config = CONFIG_FILE}
-end
-
-function exit(self)
-  stopRequested = true
-  return true
-end
+function status(self) return decode(read(STATUS)) or {state = "stopped"} end
+function exit(self) stopRequested = true; return true end

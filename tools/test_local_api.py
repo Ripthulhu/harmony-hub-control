@@ -108,6 +108,30 @@ def check_resources(request, cookie, csrf, resources):
     assert bt["commands"] == [{"name": "Text", "script": script, "delayMs": 50}]
     assert mutate("devices", action="delete", transport="bluetooth", deviceId=bt_id)[0] == 200
     assert request("bluetooth/devices", cookie=cookie)[1]["devices"] == []
+    # Guided setup is one recoverable transaction, not three independent writes.
+    before = saved()
+    setup = dict(action="create-profile", transport="ir", name="Receiver", manufacturer="Pioneer", model="VSX-LX52", type="Audio",
+                 source="Pioneer/VSX-52.ir", payload="VOL+|raw|F9470P100S100P100S100\nVOL-|raw|F9470P100S100P100S100",
+                 layout=[{"slot": "volumeup", "label": "Volume up", "command": "VOL+"}])
+    for invalid in [dict(payload="broken"), dict(payload=setup["payload"]+"\nVOL+|raw|F9470P100S100P100S100"),
+                    dict(layout=[{"slot": "volumeup", "command": "missing"}])]:
+        config_before = request("configuration", cookie=cookie)[1]
+        assert mutate("devices", **dict(setup, **invalid))[0] == 400
+        assert saved() == before, "failed setup left an empty or partial device"
+        assert request("configuration", cookie=cookie)[1] == config_before
+    status, created, _ = mutate("devices", **setup)
+    assert status == 200, created
+    new_id = created["deviceId"]
+    config = request("configuration", cookie=cookie)[1]
+    assert config["layouts"][new_id] == setup["layout"]
+    assert config["deviceSetup"][new_id] == {"status": "untested", "source": setup["source"], "testedCommand": ""}
+    assert saved()["DevicesWithFeatures"][:-1] == before["DevicesWithFeatures"]
+    assert len(saved()["DevicesWithFeatures"][-1]["Commands"]) == 2
+    assert mutate("devices", action="delete", deviceId=new_id)[0] == 200
+    assert new_id not in request("configuration", cookie=cookie)[1]["deviceSetup"]
+    assert new_id not in request("configuration", cookie=cookie)[1]["layouts"]
+    assert saved() == before
+    print("Guided setup: atomic device/commands/layout, untested provenance and failed-import rollback passed")
     for invalid in [{"action": "connect", "type": "unknown"}, {"action": "connect", "type": "btkeyboard", "bdaddr": "invalid"}]:
         assert request("bluetooth/pair", invalid, cookie, csrf)[1]["ok"] is False
     print("Stock resources: exact IDs, JSON formatting/escapes, preserved fields, CRUD/import, malformed files and storage limits passed")
@@ -184,6 +208,7 @@ def run():
             else: raise AssertionError("server failed to start")
             assert request("devices")[0] == 401
             assert request("session", extra={"Host": "attacker.example"})[0] == 403
+            assert request("activities/state")[0] == 401
             assert request("session")[1]["buttonAvailable"]
             status, first, first_cookie = request("controllers/request", {"name": "Physical owner", "button": True})
             assert status == 200 and role(first_cookie) == "pending"
@@ -197,6 +222,10 @@ def run():
             status, owner, cookie = request("controllers/claim", {"name": "Owner", "code": code})
             assert status == 200 and owner["role"] == "owner"
             csrf = owner["csrf"]
+            bearer = {"Authorization": "Bearer " + cookie.split("=", 1)[1], "Origin": f"http://127.0.0.1:{port}"}
+            assert request("session", extra=bearer)[1]["role"] == "owner"
+            assert request("activities/state", extra=bearer)[0] == 200
+            assert request("controllers/cancel", {}, csrf=csrf, extra=bearer)[0] == 200
             status, physical, physical_cookie = request("controllers/request", {"name": "Button phone", "button": True})
             assert status == 200 and role(physical_cookie) == "pending"
             assert request("controllers/request", {"name": "Competing phone", "button": True})[0] == 409
@@ -244,6 +273,8 @@ def run():
             assert request("controllers/upgrade", {}, upgrade_cookie, "wrong")[0] == 403
             assert request("controllers/upgrade", {}, upgrade_cookie, upgrade["csrf"])[0] == 200
             assert role(upgrade_cookie) == "control" and request("session", cookie=upgrade_cookie)[1]["buttonPending"]
+            status, activity, _ = request("activities/state", cookie=upgrade_cookie)
+            assert status == 200 and activity == {"activityId": "", "estimated": True}
             assert request("controllers/cancel", {}, upgrade_cookie, upgrade["csrf"])[0] == 200
             press(); assert role(upgrade_cookie) == "control"
             assert request("controllers/upgrade", {}, upgrade_cookie, upgrade["csrf"])[0] == 200

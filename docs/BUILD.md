@@ -60,6 +60,8 @@ From the repository root on Linux:
 gcc -O0 tools/test_ir_runtime.c payload/source/vendor/cJSON.c payload/source/vendor/monocypher.c payload/source/vendor/monocypher-ed25519.c -o /tmp/test-ir && /tmp/test-ir
 gcc -O0 tools/test_hbus_hold.c -o /tmp/test-hold && /tmp/test-hold
 lua5.1 tools/test_mqtt_runtime.lua
+lua5.1 tools/test_mqtt_protocol.lua
+python3 tools/test_mqtt_broker.py
 node tools/test_profiles.mjs
 node tools/test_local_controls.mjs
 python3 tools/test_local_api.py
@@ -68,10 +70,20 @@ python3 tools/test_assets.py
 python3 tools/test_upload.py
 ```
 
+`test_mqtt_protocol.lua` and the broker test require LuaSocket and lua-cjson.
+The broker test starts and removes a Mosquitto 2 Docker container bound only to
+loopback. `test_home_assistant.py` runs inside the Home Assistant 2026.9.4 image
+with this repository on `PYTHONPATH`; it uses an in-process fake hub and sends no IR.
+
 These check IR responses, holds, release timeouts, LTCP framing, MQTT discovery
 and reloads, profile imports, browser button handling, pairing, configuration
 preservation, recovery, signed updates, and uploads without contacting a device.
 Run the C checks on the build host, not a hub.
+
+For a disposable browser walkthrough, run `python3 tools/preview_ui.py` and open
+`http://127.0.0.1:8097/`. It serves the real assets with a memory-only API fixture.
+It cannot contact a hub or transmit IR. Restarting it clears the fixture devices;
+use `test_local_api.py` to check the real backend's writes and rollback.
 
 `node tools/ir_database_smoke_test.mjs --sample 10 --seed cleanup` checks a
 repeatable sample from public profile databases. It downloads files but never

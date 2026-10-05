@@ -3,6 +3,6 @@ a20c26c86514c671a4720c0069f80b7e  codex_bthid_keyboard
 4c40847878f3bb3d9ee9213c177e0a29  codex_hal_ltcp
 66885f24237df3f29293820cfdd15cab  codex_hbus
 d16934c94f0cf1bc12f947e61accb931  codex_portal
-4bdc64d1e3166184ac508838e7be39c6  codex_webui
+aaece7bdc35a4463830ca1799894fc20  codex_webui
 3733327fd04bca282dbf06f33da0bf6c  dropbearmulti
 034252e3dc78cb548d6b99d6dcbad836  FILES

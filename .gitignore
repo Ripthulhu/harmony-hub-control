@@ -26,14 +26,22 @@ firmware_analysis/
 # Secrets and machine-local SSH material
 *.key
 *.pem
+*.ppk
+*.p12
+*.pfx
+.ssh/
+.storage/
 id_*
 *_ed25519
 *_rsa
 known_hosts
 authorized_keys
 .env
+.env.*
+.envrc
 secrets.*
 config.local.json
+harmony-sensitive-backup*.json
 harmony_hub_id.txt
 harmony_hub_id.json
 
@@ -46,6 +54,10 @@ build/tmp/
 *.map
 
 # Python and PowerShell scratch
+.venv/
+venv/
+env/
+ENV/
 __pycache__/
 *.pyc
 *.ps1xml

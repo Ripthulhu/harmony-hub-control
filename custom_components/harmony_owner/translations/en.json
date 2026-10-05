@@ -1,0 +1,21 @@
+{
+  "title": "Harmony Owner",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to your hub",
+        "description": "Enter the IPv4 address of the hub's local UI. Old admin passwords are no longer used.",
+        "data": {"host": "Hub IPv4 address", "port": "Port", "pairing": "Pair using"}
+      },
+      "pair": {
+        "title": "Approve Home Assistant",
+        "description": "{approval}\n\nThen select Submit. Hub: {hub_url}\n\nThis connection uses unencrypted HTTP on your trusted LAN."
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect or start pairing. Check the hub address, and make sure no other controller is waiting to pair.",
+      "not_paired": "Home Assistant is not approved yet. Approve it, then try again. If the request expired, cancel and start again."
+    },
+    "abort": {"already_configured": "This hub is already configured.", "reauth_successful": "Home Assistant is paired again.", "reconfigure_successful": "Hub connection updated."}
+  }
+}

@@ -23,7 +23,8 @@ An existing control-only browser can POST `controllers/upgrade` with its cookie
 and CSRF token, then press Pair to become an owner without changing its identity.
 Cancelling or expiring this request leaves its existing control access unchanged.
 
-Authenticated requests send the cookie. Mutations also send
+Authenticated requests send the cookie or `Authorization: Bearer <cookie-value>`.
+Mutations also send
 `X-Harmony-CSRF: <token>` and a matching Origin. Host must be the numeric hub
 address and port; DNS aliases and cross-origin requests are rejected.
 
@@ -40,6 +41,7 @@ address and port; DNS aliases and cross-origin requests are rejected.
 | commands/save, commands/import | POST | Owner command editing/import |
 | commands/learn | POST | Owner IR capture |
 | activities/run | POST | Enqueue local activity or estimated-state repair |
+| activities/state | GET | Estimated local activity; empty ID means unknown |
 | activities/native | GET | Preserved original native activities |
 | operations?id=<id> | GET | Operation state/result |
 | operations | POST | Cancel or renew an owned hold |
@@ -47,7 +49,7 @@ address and port; DNS aliases and cross-origin requests are rejected.
 | setup | POST | Choose keep or restore; fresh setup remains disabled |
 | backups/portable, backups/full | GET | Owner exports |
 | backups/restore | POST | Owner portable configuration restore |
-| integrations/mqtt | GET/POST | Owner optional integration settings |
+| integrations/mqtt | GET/POST | Owner integration settings and latest runtime status; no password in replies |
 | network/wifi, network/confirm | POST | Owner network trial/confirmation |
 | maintenance/reboot | POST | Owner normal reboot |
 | updates/begin, updates/chunk, updates/apply | POST | Owner signed release activation |
@@ -73,6 +75,19 @@ also stops the sequence. Bluetooth long holds are not advertised.
 Owner configuration mutations include the last observed `revision`.
 A stale revision returns 409 rather than overwriting another browser's work.
 Malformed imports, unsupported schemas and low storage are rejected.
+
+`POST devices` with `action:"create-profile"` creates an IR device with its
+commands and remote layout in one transaction. Supply `revision`, `transport:"ir"`,
+`name`, `manufacturer`, `model`, `type`, `source`, `payload` (the same line format
+as `commands/import`) and `layout` (an array of `slot`, `label`, `command`).
+Duplicate or invalid commands and assignments to missing commands reject the
+whole setup. The response includes the new `deviceId`. This action never sends IR.
+
+Configuration may contain `deviceSetup`, keyed by device ID. Each record stores
+`source`, `status` (`untested`, `responded`, or `no-response`) and `testedCommand`.
+New profiles start untested. A recorded response is the owner's confirmation of
+that command only, not a guarantee about the whole profile. Command edits clear
+the test record. Older devices without records have no recorded test result.
 
 Browser restore changes portable device/activity resources only. Sensitive
 exports contain Wi-Fi/MQTT settings, but restoring those credentials requires

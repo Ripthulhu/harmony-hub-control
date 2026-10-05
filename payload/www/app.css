@@ -56,6 +56,7 @@ main{min-width:0;padding:30px 40px 60px}
 .dpad .ok{grid-column:2;grid-row:2;font-weight:650}
 .dpad .right{grid-column:3;grid-row:2}
 .dpad .down{grid-column:2;grid-row:3}
+.dpad:empty,.remote-group:empty,.remote .playback:empty{display:none}
 .remote-pairs{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:16px}
 .remote-pairs>div{display:grid;align-content:start;gap:8px;text-align:center}
 .remote-pairs button{width:100%;height:52px}
@@ -80,6 +81,18 @@ main{min-width:0;padding:30px 40px 60px}
 .choice-list{display:flex;flex-direction:column;gap:12px;max-width:480px;margin:24px 0}
 .choice-list button{text-align:left}
 .check-label{font-size:16px;font-weight:400}
+.setup-progress{display:flex;gap:20px;list-style:none;padding:0 0 16px;margin:0 0 24px;border-bottom:1px solid var(--line);font-size:14px;color:var(--muted)}
+.setup-progress [aria-current=step]{color:var(--accent);font-weight:650}
+.choice-list button{display:flex;align-items:center;gap:12px}
+.profile-source{display:block;overflow-wrap:anywhere}
+.command-selection{max-height:360px;overflow:auto;border-block:1px solid var(--line);overscroll-behavior:contain;padding:4px}
+.command-selection .check-label{display:flex;align-items:center;gap:10px;min-height:48px;margin:0;padding:6px 8px;overflow-wrap:anywhere}
+.command-selection input{flex-shrink:0;margin:0}
+.selection-tools{margin:12px 0}
+.setup-actions p{flex-basis:100%;margin:0}
+.review-control{display:grid;grid-template-columns:minmax(120px,1fr) minmax(0,2fr);gap:16px;align-items:center;margin:0;padding:10px 0;border-bottom:1px solid var(--line)}
+.review-control span{display:flex;align-items:center;gap:10px}
+.review-control svg{height:20px;width:20px}
 .activity-step{padding:0 0 20px;margin-bottom:20px;border-bottom:1px solid var(--line)}
 .step-row{display:grid;grid-template-columns:minmax(0,1fr) 112px 48px;gap:8px;align-items:end}
 .step-row label{margin-top:0}
@@ -107,6 +120,8 @@ button .label{font-size:14px}
 .pairing .toolbar button{min-width:160px}
 .pairing .topbar{flex-wrap:wrap}
 @media(max-width:700px){
+  .setup-actions{position:sticky;bottom:82px;padding:12px 0;margin-bottom:0;background:var(--bg);border-top:1px solid var(--line)}
+  .command-selection{max-height:32dvh}
   .shell{display:block}main{padding:16px 20px 110px}
   #notice{min-height:20px;line-height:20px;margin-bottom:4px}
   nav{position:fixed;bottom:0;left:0;right:0;z-index:2;flex-direction:row;background:var(--surface);border-right:0;border-top:1px solid var(--line);padding:8px 8px max(8px,env(safe-area-inset-bottom));gap:0;justify-content:space-around}

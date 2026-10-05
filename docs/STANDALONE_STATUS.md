@@ -2,9 +2,46 @@
 
 This file records acceptance evidence, not a release claim.
 
+## MQTT And Home Assistant Rewrite (2026-10-05)
+
+Deployed to the verified Harmony Hub / 4.15.600 and the existing Home Assistant
+installation. The hub, integration and router configuration were backed up
+off-device before changes. The hub backup ZIP and file hashes were verified.
+
+- Harmony Owner now uses paired `/api/v1` access instead of retired Basic Auth.
+  Re-pairing preserves the existing remote's identity. Native remote services
+  support repeats, bounded holds, cancellation and operation failures.
+- MQTT uses the local inventory, preserves its existing discovery IDs, publishes
+  saved-device command buttons, refreshes changed discovery and removes stale
+  command entries. It checks partial writes, subscription acknowledgement and
+  ping replies, and does not suppress repeated taps.
+- Disposable tests passed against Home Assistant 2026.9.4, Lua 5.1 and Mosquitto 2.
+  Broker outage/reconnect, retained-command rejection, discovery pruning and last
+  will were checked without a physical IR sender. Native API tests also passed.
+- The broker address was corrected without changing credentials, client identity
+  or topics. Home Assistant received retained online availability, four devices
+  and 118 commands. Discovery exposes five devices and 125 entities, with extra
+  command buttons disabled by default.
+- A router capture identified the blocked Home Assistant-to-hub API connection.
+  A narrow persistent rule permits only that host to reach that hub on TCP 8080.
+  Harmony Owner was re-paired through owner approval; the existing
+  `remote.harmony_hub_owner` entity was preserved. Its activity state remains
+  unknown when no activity is running.
+- The owner confirmed a real LG C5 volume-down tap and half-second Volume Up hold
+  through Home Assistant. The tap completed; the hold ended with a successful
+  native release and no active operation. No other devices were tested.
+- Delayed activities now forward scheduler yields through a protected coroutine
+  on Lua 5.1. A regression checks completion and cancellation during a delay.
+  Settings now shows MQTT connection status without returning broker passwords.
+- Live Settings was inspected at 390x844 and 1280x900 in Edge. MQTT status and
+  form fields render without horizontal overflow; keyboard focus reaches Port.
+  Temporary browser viewport overrides were removed after the check.
+
+This does not satisfy the offline-soak or fresh-hub acceptance gates below.
+
 ## Required gates
 
-- [x] Working installation and configuration backed up off-device (latest backup 2026-10-03 17:18, ZIP and hashes verified).
+- [x] Working installation and configuration backed up off-device (latest backup 2026-10-05 19:55, ZIP and hashes verified).
 - [x] Pairing, revocation, origin checks and owner-only mutations tested in a disposable host instance.
 - [x] Serialized configuration writes, journal recovery and conflict tests in a disposable host instance.
 - [x] One control coordinator for browser, activities and MQTT (host tests; live IR tap, renewed hold and lost-controller release accepted by native engine).
@@ -113,3 +150,33 @@ All five MIPS helpers rebuilt. `codex_webui` is 339,236 bytes, down from 351,476
 the other four helpers are unchanged. The rebuilt binary and checksum are in the
 repository. This cleanup has not been deployed to the live hub and does not close
 the outstanding hardware, blank-hub or offline-soak tests above.
+
+## Device setup flow, 2026-10-04
+
+IR setup now keeps a browser draft through device details, profile selection and
+remote assignments. The final save writes the device, commands and layout in one
+recoverable transaction. Cancelling does not create an empty device. Tests are
+optional and require an explicit send followed by the owner's confirmation.
+
+Community search ignores model punctuation, ranks matching names and model
+families first, and paginates instead of silently dropping results. Related and
+generic profiles are not presented as verified matches. Command selection has
+basic/all/clear actions and filtering. Common receiver volume, arrow, menu and
+play/pause names map automatically. Back preserves selections; saving assignments
+opens the edited device's remote. Empty control groups do not reserve blank space.
+
+Passed host tests for atomic setup, invalid-import rollback, stock preservation,
+access, revisions, signed updates, recovery, parsing and press/hold/release.
+Browser walkthroughs at 390x844 and 1280x900 covered Pioneer and Bose candidate
+selection, bulk selection, review, save-without-testing, and simulated explicit
+testing. The preview uses memory-only storage and never transmits IR. Browser
+control stalled on the discard-confirmation dialog; post-deployment visual
+confirmation awaits dismissing that dialog. No hardware test was performed.
+
+Deployed the rebuilt 341,704-byte web service and three changed web assets through
+owner SSH, without rebooting or changing hardware services. Verified backup:
+`backups/standalone/20261004-022850-harmony.zip` outside the repository. All 154
+backed-up JSON files remained byte-identical. Read-only live access checks pass:
+four IR devices, 118 commands. The previous cleanup's native resource changes and
+standalone profile parsers are now live; its maintenance-script change was not
+part of this deployment. The broader release gates above remain open.

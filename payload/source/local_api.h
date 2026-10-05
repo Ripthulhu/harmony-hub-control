@@ -586,6 +586,15 @@ done:
 static int local_validate_config(const cJSON *o) {
     cJSON *activities = lj_get(o, "activities"), *layouts = lj_get(o, "layouts"), *a, *b;
     cJSON *revision = lj_get(o, "revision"); const char *mode = lj_str(o, "setupMode");
+    cJSON *setup = lj_get(o, "deviceSetup");
+    if (setup && (!cJSON_IsObject(setup) || cJSON_GetArraySize(setup) > 128)) return 0;
+    cJSON_ArrayForEach(a, setup) {
+        const char *status = lj_str(a, "status");
+        if (!a->string || !safe_run_id(a->string) || strlen(a->string) > 64 || !cJSON_IsObject(a) ||
+            strlen(lj_str(a, "source")) > 512 || strlen(lj_str(a, "testedCommand")) > 127 ||
+            (strcmp(status, "untested") && strcmp(status, "responded") && strcmp(status, "no-response")) ||
+            (!strcmp(status, "responded") && !safe_label(lj_str(a, "testedCommand")))) return 0;
+    }
     if (!cJSON_IsObject(o) || lj_int(o, "schemaVersion", 0) != 1 || !cJSON_IsArray(activities) ||
         cJSON_GetArraySize(activities) > 16 || !cJSON_IsObject(layouts) || !cJSON_IsNumber(revision) ||
         revision->valuedouble != revision->valueint || revision->valueint < 1 || revision->valueint >= 2000000000 ||
@@ -652,9 +661,37 @@ static void local_configuration_change(int fd, const struct request *r, cJSON *b
         if (strcmp(lj_str(body, "transport"), "bluetooth") == 0) {
             if (!strcmp(action, "delete")) rc = delete_bt_device(id, msg, sizeof(msg));
             else if (bt_type_allowed(lj_str(body, "type"))) rc = upsert_bt_device(id, lj_str(body, "name"), lj_str(body, "type"), lj_str(body, "bdaddr"), msg, sizeof(msg));
+        } else if (!strcmp(action, "create-profile")) {
+            /* One journal covers the device, commands, layout and test record. */
+            char *payload = strdup(lj_str(body, "payload"));
+            cJSON *layout = lj_get(body, "layout"), *setup = lj_get(config, "deviceSetup"), *record;
+            if (payload && cJSON_IsArray(layout) && strlen(lj_str(body, "source")) <= 512) {
+                rc = create_ir_device_ex(lj_str(body, "name"), lj_str(body, "manufacturer"), lj_str(body, "model"), lj_str(body, "type"), msg, sizeof(msg), created, sizeof(created));
+                if (!rc) rc = bulk_import_irdb_commands(created, payload, msg, sizeof(msg), 1);
+                if (!rc) {
+                    if (!setup) setup = cJSON_AddObjectToObject(config, "deviceSetup");
+                    record = cJSON_AddObjectToObject(setup, created);
+                    cJSON_AddStringToObject(record, "source", lj_str(body, "source"));
+                    cJSON_AddStringToObject(record, "status", "untested");
+                    cJSON_AddStringToObject(record, "testedCommand", "");
+                    if (!record || !cJSON_AddItemToObject(lj_get(config, "layouts"), created, cJSON_Duplicate(layout, 1)) || !local_validate_config(config)) rc = -1;
+                    if (!rc) {
+                        cJSON *resources = resource_read(DEVICE_LIST, "DevicesWithFeatures"), *b;
+                        cJSON *commands = lj_get(resource_device(resources, created), "Commands");
+                        cJSON_ArrayForEach(b, layout) if (!resource_command(commands, lj_str(b, "command"))) rc = -1;
+                        cJSON_Delete(resources);
+                    }
+                    if (rc) snprintf(msg, sizeof(msg), "Invalid remote layout. Device setup was not saved.");
+                }
+            }
+            free(payload);
         } else if (!strcmp(action, "create")) rc = create_ir_device_ex(lj_str(body, "name"), lj_str(body, "manufacturer"), lj_str(body, "model"), lj_str(body, "type"), msg, sizeof(msg), created, sizeof(created));
         else if (!strcmp(action, "delete")) rc = delete_ir_device(id, msg, sizeof(msg));
         else if (!strcmp(action, "update")) rc = update_ir_device(id, lj_str(body, "name"), lj_str(body, "manufacturer"), lj_str(body, "model"), lj_str(body, "type"), msg, sizeof(msg));
+        if (!rc && !strcmp(action, "delete")) {
+            cJSON_DeleteItemFromObjectCaseSensitive(lj_get(config, "layouts"), id);
+            cJSON_DeleteItemFromObjectCaseSensitive(lj_get(config, "deviceSetup"), id);
+        }
     } else if (strcmp(path, "/api/v1/commands/save") == 0) {
         if (!strcmp(lj_str(body, "transport"), "bluetooth"))
             rc = upsert_bt_command(lj_str(body, "deviceId"), lj_str(body, "oldName"), lj_str(body, "name"), lj_str(body, "script"), lj_int(body, "delayMs", 35), msg, sizeof(msg));
@@ -663,7 +700,7 @@ static void local_configuration_change(int fd, const struct request *r, cJSON *b
         else rc = add_ir_command(lj_str(body, "deviceId"), lj_str(body, "name"), lj_str(body, "mode"), lj_str(body, "protocol"), lj_str(body, "nec"), lj_str(body, "keycode"), lj_str(body, "raw"), msg, sizeof(msg));
     } else if (strcmp(path, "/api/v1/commands/import") == 0) {
         char *payload = strdup(lj_str(body, "payload"));
-        if (payload) { rc = bulk_import_irdb_commands(lj_str(body, "deviceId"), payload, msg, sizeof(msg)); free(payload); }
+        if (payload) { rc = bulk_import_irdb_commands(lj_str(body, "deviceId"), payload, msg, sizeof(msg), 0); free(payload); }
     } else if (strcmp(path, "/api/v1/backups/restore") == 0) {
         cJSON *backup = lj_get(body, "backup"), *resources = lj_get(backup, "resources"), *next = lj_get(backup, "configuration"); size_t i;
         if (lj_int(backup, "schemaVersion", 0) != 1 || !local_validate_config(next) || !cJSON_IsObject(resources)) snprintf(msg, sizeof(msg), "Unsupported or malformed backup.");
@@ -678,6 +715,13 @@ static void local_configuration_change(int fd, const struct request *r, cJSON *b
                 for (i = 1; i < sizeof(local_files) / sizeof(local_files[0]); i++) if (lj_write(local_files[i], lj_get(resources, strrchr(local_files[i], '/') + 1)) != 0) { rc = -1; break; }
                 if (rc == 0) { cJSON_Delete(config); config = cJSON_Duplicate(next, 1); cJSON_ReplaceItemInObjectCaseSensitive(config, "revision", cJSON_CreateNumber(lj_int(body, "revision", 0))); request_resource_reload(); }
             }
+        }
+    }
+    if (!rc && (!strcmp(path, "/api/v1/commands/import") || !strcmp(path, "/api/v1/commands/save"))) {
+        cJSON *record = lj_get(lj_get(config, "deviceSetup"), lj_str(body, "deviceId"));
+        if (record) {
+            cJSON_ReplaceItemInObjectCaseSensitive(record, "status", cJSON_CreateString("untested"));
+            cJSON_ReplaceItemInObjectCaseSensitive(record, "testedCommand", cJSON_CreateString(""));
         }
     }
     if (rc == 0 && local_commit(config) == 0) {
@@ -801,6 +845,8 @@ static void local_mqtt(int fd, const struct request *r, const cJSON *body) {
         trigger_mqtt_discover();
     }
     reply = cJSON_Duplicate(config, 1); cJSON_DeleteItemFromObjectCaseSensitive(lj_get(reply, "broker"), "password");
+    { cJSON *status = lj_read(LOCAL_OPS "/mqtt-status.json", 4096);
+      if (status) cJSON_AddItemToObject(reply, "status", status); }
     cJSON_AddBoolToObject(reply, "ok", 1); lj_reply(fd, "200 OK", reply); cJSON_Delete(reply);
 done:
     if (lock >= 0) close(lock); cJSON_Delete(config);
@@ -852,11 +898,16 @@ static int local_dispatch(int fd, const struct request *r) {
     owner = !(strncmp(r->path, "/api/v1/operations", 18) == 0 ||
         !strcmp(r->path, "/api/v1/commands/send") ||
         !strcmp(r->path, "/api/v1/activities/run") ||
+        (get && !strcmp(r->path, "/api/v1/activities/state")) ||
         (get && (!strcmp(r->path, "/api/v1/devices") || !strcmp(r->path, "/api/v1/bluetooth/devices") || !strcmp(r->path, "/api/v1/configuration"))));
     if (!local_auth(fd, r, &ctl, owner)) return 1;
     if (!get) { body = lj_parse(r->body); if (!cJSON_IsObject(body)) { local_error(fd, "400 Bad Request", "Expected a valid JSON object without duplicate fields."); cJSON_Delete(body); return 1; } }
     if (!strcmp(r->path, "/api/v1/configuration") && get) {
         out = local_config(); lj_reply(fd, "200 OK", out); cJSON_Delete(out);
+    } else if (!strcmp(r->path, "/api/v1/activities/state") && get) {
+        out = lj_read(LOCAL_OPS "/activity-state.json", 4096);
+        if (!out) out = lj_parse("{\"activityId\":\"\",\"estimated\":true}");
+        lj_reply(fd, "200 OK", out); cJSON_Delete(out);
     } else if (!strcmp(r->path, "/api/v1/devices") && get) render_inventory_json(fd);
     else if (!strcmp(r->path, "/api/v1/bluetooth/devices") && get) send_bt_devices_download(fd);
     else if (!strcmp(r->path, "/api/v1/controllers")) local_controllers(fd, r, &ctl, body);

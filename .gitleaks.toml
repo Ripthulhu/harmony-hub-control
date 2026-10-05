@@ -1,0 +1,12 @@
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Fixed loopback WebSocket handshake nonce, not a credential."
+condition = "AND"
+paths = ['''(^|/)payload/source/codex_hbus\.c$''']
+regexTarget = "match"
+regexes = ['''^Sec-WebSocket-Key: (MDEyMzQ1Njc4OWFiY2RlZg==|0123456789abcdef)\\r$''']

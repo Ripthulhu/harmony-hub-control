@@ -1278,7 +1278,7 @@ static int append_text(char **buf, size_t *len, size_t *cap, const char *text, i
     return 0;
 }
 
-static int bulk_import_irdb_commands(const char *device_id, char *payload, char *msg, size_t msglen) {
+static int bulk_import_irdb_commands(const char *device_id, char *payload, char *msg, size_t msglen, int strict) {
     char *line, *save;
     cJSON *root, *commands;
     long next_id, max_command_id = 0;
@@ -1364,6 +1364,11 @@ static int bulk_import_irdb_commands(const char *device_id, char *payload, char 
         imported++;
         if (strcasecmp(mode, "raw") != 0) imported_keycodes++;
         line = strtok_r(NULL, "\n", &save);
+    }
+    if (strict && skipped) {
+        cJSON_Delete(root);
+        snprintf(msg, msglen, "Profile contains duplicate, invalid or too many commands. Nothing was saved.");
+        return -1;
     }
     if (imported == 0) {
         cJSON_Delete(root);

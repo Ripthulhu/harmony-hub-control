@@ -31,7 +31,8 @@ local function upvalue(fn, name)
   end
   error("missing upvalue " .. name)
 end
-local recv = upvalue(tasks.codexmqtt, "recvPacket")
+local connection = upvalue(tasks.codexmqtt, "runConnection")
+local recv = upvalue(connection, "recvPacket")
 local function packet(parts, expected)
   local index = 0
   local sock = {receive = function()
@@ -88,14 +89,14 @@ package.loaded["tasks.harmonywebservices.core.session"].getAccount = function() 
 sys.getNetworkAttribute = function() return "192.0.2.1" end
 sys.getFirmwareVersion = function() return "test" end
 package.loaded.json.encode = function(payload)
-  payloads[payload.unique_id] = payload
+  if payload.unique_id then payloads[payload.unique_id] = payload end
   return "{}"
 end
-upvalue(tasks.codexmqtt, "publishDiscovery")({send = function(_, packet)
+upvalue(connection, "publishDiscovery")({send = function(_, packet)
   assert(packet:byte(1) == 49) -- Retained PUBLISH.
   topics[#topics+1] = packet
   return #packet
-end}, {haDiscovery=true, clientId="test", baseTopic="hub", discoveryPrefix="ha", name="Hub"})
+end}, {haDiscovery=true, clientId="test", baseTopic="hub", discoveryPrefix="ha", name="Hub"}, {devices={}})
 local sensors = {
   activity_id={"Activity ID", "activityId", "mdi:identifier"},
   ip={"IP Address", "ip", "mdi:ip-network"},
@@ -109,7 +110,6 @@ for id, expected in pairs(sensors) do
   assert(p.value_template == "{{ value_json." .. expected[2] .. " }}")
   assert(p.state_topic == "hub/state" and p.availability_topic == "hub/status")
   assert(p.entity_category == "diagnostic" and p.device.identifiers[1] == "test")
-  assert(p.json_attributes_topic == (id == "ip" and "hub/state" or nil))
   local found = false
   for _, packet in ipairs(topics) do
     if packet:find("ha/sensor/test_" .. id .. "/config", 1, true) then found = true end
@@ -144,6 +144,28 @@ assert(#requested == 2 and requested[1].command == "On")
 files["/tmp/harmony-operations/activity-test.cancel"] = "1"
 local ok, err = core.runActivity(op, previous)
 assert(not ok and err == "cancelled")
+-- Exercise the actual task: pcall cannot yield around a sequence on Lua 5.1.
+os.rename, os.remove = function(from, to)
+  files[to], files[from] = files[from], nil; return true
+end, function(path) files[path] = nil; return true end
+local root = "/tmp/harmony-operations/"
+local sequence = {id = "delayed", kind = "activity", state = "queued",
+  request = {id = "local-test", steps = {{kind = "delay", delayMs = 200}, {deviceId = "tv", command = "On"}}}}
+files[root .. "activity-current"], files[root .. "delayed.json"] = sequence.id, sequence
+local activityWorker = coroutine.create(tasks["harmony-local-activities"])
+local resumed, wait = coroutine.resume(activityWorker)
+assert(resumed and wait == 100 and sequence.state == "running")
+assert(coroutine.resume(activityWorker))
+assert(coroutine.resume(activityWorker))
+assert(sequence.state == "completed" and files[root .. "activity-state.json"].activityId == "local-test")
+local interrupted = {id = "cancel-delay", kind = "activity", state = "queued",
+  request = {id = "cancel-test", steps = {{kind = "delay", delayMs = 200}}}}
+files[root .. "activity-current"], files[root .. "cancel-delay.json"] = interrupted.id, interrupted
+assert(coroutine.resume(activityWorker))
+assert(interrupted.state == "running")
+files[root .. "cancel-delay.cancel"] = "1"
+assert(coroutine.resume(activityWorker))
+assert(interrupted.state == "cancelled" and files[root .. "activity-state.json"].activityId == "")
 io.open, os.rename, os.remove = oldOpen, oldRename, oldRemove
 package.loaded.json.decode, package.loaded.json.encode = rawDecode, rawEncode
 print("Local activity switching, estimated-state repair and cancellation passed")

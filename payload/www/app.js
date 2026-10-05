@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const state = {session:null, config:null, devices:[], view:'remote', hold:null, online:false, editor:null};
+const state = {session:null, config:null, devices:[], view:'remote', hold:null, online:false, editor:null, draft:null};
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const icon = name => `<svg aria-hidden="true"><use href="/icons.svg#icon-${escape(name)}"></use></svg>`;
 const owner = () => state.session?.role === 'owner';
@@ -21,7 +21,13 @@ async function api(path, body) {
   } catch(error) {if(error.name==='AbortError'||error instanceof TypeError)connection(false);throw error;}
   finally {clearTimeout(timeout);}
 }
-function mount(html) {stopHold(false);$('content').innerHTML=html;$('content').setAttribute('aria-busy','false');}
+function mount(html) {stopHold(false);notice('');$('content').innerHTML=html;$('content').setAttribute('aria-busy','false');$('main').focus({preventScroll:true});}
+async function busy(button, label, task) {
+  if(button.disabled)return;
+  const text=button.textContent;button.disabled=true;button.textContent=label;
+  try {await task();}catch(error){if(button.isConnected)notice(error.message,true);}
+  finally {if(button.isConnected){button.disabled=false;button.textContent=text;}}
+}
 function field(label,name,value='',type='text',extra='') {return `<label for="${name}">${escape(label)}</label><input id="${name}" name="${name}" type="${type}" value="${escape(value)}" ${extra}>`;}
 function deviceOptions(selected='') {return state.devices.map(d=>`<option value="${escape(d.id)}" ${d.id===selected?'selected':''}>${escape(d.name)}</option>`).join('');}
 function commandOptions(deviceId,selected='') {const d=state.devices.find(d=>d.id===deviceId);return `<option value="">Choose command</option>`+(d?.commands||[]).map(c=>`<option value="${escape(c.name)}" ${c.name===selected?'selected':''}>${escape(c.name)}</option>`).join('');}
@@ -30,16 +36,23 @@ function deviceTypeOptions(selected='Television') {
   if(!types.includes(selected))types.unshift(selected);
   return types.map(type=>`<option ${type===selected?'selected':''}>${escape(type)}</option>`).join('');
 }
-const norm = name => String(name).toLowerCase().replace(/[^a-z0-9]/g,'');
+const norm = name => String(name).toLowerCase().replace(/\+/g,'up').replace(/-\s*$/,'down').replace(/[^a-z0-9]/g,'');
 const controls = [
   ['power','Power','Power',['power','powertoggle','onoff']],['poweron','Power on','Power',['poweron','on']],['poweroff','Power off','Power',['poweroff','off']],
-  ['input','Input','LogIn',['input','inputnext','source']],['up','Up','ChevronUp',['directionup','up','arrowup']],['left','Left','ChevronLeft',['directionleft','left','arrowleft']],
-  ['ok','OK',null,['ok','select','enter']],['right','Right','ChevronRight',['directionright','right','arrowright']],['down','Down','ChevronDown',['directiondown','down','arrowdown']],
-  ['back','Back','Undo2',['back','return']],['home','Home','House',['home','smarthome']],['menu','Menu','Menu',['menu','settings']],
+  ['input','Input','LogIn',['inputnext','inputup','input','source']],['up','Up','ChevronUp',['directionup','up','arrowup','uparrow']],['left','Left','ChevronLeft',['directionleft','left','arrowleft','leftarrow']],
+  ['ok','OK',null,['ok','select','enter']],['right','Right','ChevronRight',['directionright','right','arrowright','rightarrow']],['down','Down','ChevronDown',['directiondown','down','arrowdown','dnarrow','downarrow']],
+  ['back','Back','Undo2',['back','return']],['home','Home','House',['home','smarthome']],['menu','Menu','Menu',['menu','settings','homemenu']],
   ['volumeup','Volume up','Plus',['volumeup','volup']],['volumedown','Volume down','Minus',['volumedown','voldown','voldn']],['mute','Mute','VolumeX',['mute']],
   ['channelup','Channel up','ChevronUp',['channelup','programup','pageup','chnext']],['channeldown','Channel down','ChevronDown',['channeldown','programdown','pagedown','chprev']],
-  ['rewind','Rewind','Rewind',['rewind','rew']],['play','Play','Play',['play']],['pause','Pause','Pause',['pause']],['stop','Stop','Square',['stop']],['forward','Fast forward','FastForward',['fastforward','forward']]
+  ['rewind','Rewind','Rewind',['rewind','rew']],['play','Play','Play',['play','playpause']],['pause','Pause','Pause',['pause']],['stop','Stop','Square',['stop']],['forward','Fast forward','FastForward',['fastforward','forward']]
 ];
+function matchCommand(commands,aliases) {return aliases.map(alias=>commands.find(c=>norm(c.name)===alias)).find(Boolean);}
+function defaultLayout(commands) {
+  return controls.map(([slot,label,,aliases])=>{const command=matchCommand(commands,aliases)?.name;
+    if(slot==='play'&&norm(command)==='playpause')label='Play / pause';
+    if(slot==='input'&&['inputup','inputnext'].includes(norm(command)))label='Next input';
+    return {slot,label,command};}).filter(b=>b.command);
+}
 function activeDevice() {return state.devices.find(d=>d.id===readLocal('harmony-device'))||state.devices[0];}
 function activeActivity() {return state.config?.activities?.find(a=>a.id===readLocal('harmony-activity'));}
 function remoteButton(slot,device) {
@@ -51,7 +64,8 @@ function remoteButton(slot,device) {
     return `<button class="${key}" data-command="${escape(assignment.command)}" data-device="${escape(assignment.deviceId)}" aria-label="${escape(assignment.label||label)}" title="${escape(assignment.label||label)}">${face(assignment.label||label)}</button>`;
   }
   const custom=state.config?.layouts?.[device.id]?.find(c=>c.slot===key);
-  const command=custom?device.commands.find(c=>c.name===custom.command):device.commands.find(c=>aliases.includes(norm(c.name)));
+  const layout=state.config?.layouts?.[device.id];
+  const command=custom?device.commands.find(c=>c.name===custom.command):layout?null:matchCommand(device.commands,aliases);
   if(!command) return '';
   return `<button class="${escape(key)}" data-command="${escape(command.name)}" data-device="${escape(device.id)}" aria-label="${escape(custom?.label||label)}" title="${escape(custom?.label||label)}">${face(custom?.label||label)}</button>`;
 }
@@ -141,35 +155,57 @@ function drawer() {
 $('close-drawer').addEventListener('click',()=>{stopHold(false);$('drawer').close();});
 $('drawer').addEventListener('close',()=>stopHold(false));
 function renderDevices() {
-  mount(`<div class="toolbar">${owner()?'<button data-action="add-device" class="primary">'+icon('Plus')+' Add device</button>':''}</div><div class="list">${state.devices.map(d=>`<div class="list-row"><div class="text"><strong>${escape(d.name)}</strong><small>${escape(d.manufacturer||'Bluetooth')} ${escape(d.model||d.type||'')}</small></div><div class="row-actions"><button data-action="open-device" data-id="${escape(d.id)}" title="Open remote">${icon('Radio')}</button>${owner()?'<button data-action="edit-device" data-id="'+escape(d.id)+'" title="Edit device">'+icon('SlidersHorizontal')+'</button>':''}</div></div>`).join('')||'<p>No saved devices.</p>'}</div>`);
+  mount(`<div class="toolbar">${owner()?'<button data-action="add-device" class="primary">'+icon('Plus')+' Add device</button>':''}</div><div class="list">${state.devices.map(d=>`<div class="list-row"><div class="text"><strong>${escape(d.name)}</strong>${d.name===`${d.manufacturer} ${d.model}`?'':`<small>${escape(d.manufacturer||'Bluetooth')} ${escape(d.model||d.type||'')}</small>`}<small>${d.commands.length} commands${d.transport==='ir'?' - '+escape(deviceTestStatus(d)):''}</small></div><div class="row-actions"><button data-action="open-device" data-id="${escape(d.id)}" title="Open ${escape(d.name)} remote">${icon('Radio')}</button>${owner()?'<button data-action="edit-device" data-id="'+escape(d.id)+'" title="Edit '+escape(d.name)+'">'+icon('SlidersHorizontal')+'</button>':''}</div></div>`).join('')||'<p>No saved devices.</p>'}</div>`);
+}
+function deviceTestStatus(device) {
+  if(!device.commands.length)return 'No commands yet';
+  const record=state.config.deviceSetup?.[device.id];
+  return record?.status==='responded'?`${record.testedCommand} confirmed`:record?.status==='no-response'?'Test did not respond':'Not tested here';
 }
 async function mutate(path,body) {const result=await api(path,{...body,revision:state.config.revision});state.config=await api('configuration');return result;}
 async function saveConfig(configuration) {await mutate('configuration',{configuration});}
 function renderDeviceEditor(device=null) {
   state.editor=device;
-  mount(`<div class="editor"><h2>${device?'Edit device':'Add device'}</h2><form id="device-form">${field('Name','device-name',device?.name||'','text','required maxlength="100"')}
+  mount(`<div class="editor">${device?'':setupProgress(0)}<h2>${device?'Edit device':'Add device'}</h2><form id="device-form">${field('Name','device-name',device?.name||'','text','required maxlength="100"')}
     ${!device?'<label for="transport">Control type</label><select id="transport"><option value="ir">Infrared</option><option value="bluetooth">Bluetooth keyboard / supported HID profile</option></select>':''}
     <div id="ir-fields" ${device?.transport==='bluetooth'?'hidden':''}><div class="fields"><div>${field('Brand','manufacturer',device?.manufacturer||'','text','required')}</div><div>${field('Model','model',device?.model||'','text','required')}</div></div><label for="device-type">Device type</label><select id="device-type">${deviceTypeOptions(device?.type||'Television')}</select></div>
     <div id="bt-fields" ${device?.transport!=='bluetooth'?'hidden':''}><label for="bt-type">Profile</label><select id="bt-type"><option value="btkeyboard">Bluetooth keyboard</option><option value="fire">Fire TV</option><option value="btkeyboard-nexus">Nexus keyboard</option><option value="ps3">PlayStation 3</option><option value="wii">Nintendo Wii</option></select>${field('Paired address','bt-address',device?.bdaddr||'','text','pattern="[0-9A-Fa-f:]{17}"')}<div class="toolbar"><button type="button" data-action="bt-pair">Start pairing</button><button type="button" data-action="bt-status">Check pairing</button><button type="button" data-action="bt-stop">Finish pairing</button></div><pre id="bt-result" hidden></pre></div>
     <div class="toolbar"><button class="primary" type="submit">${device?'Save device':'Create device'}</button><button type="button" data-action="devices">Cancel</button>${device?'<button type="button" data-action="delete-device" class="danger">Delete device</button>':''}</div></form>
     ${device?'<section class="section"><h2>Commands</h2><div class="toolbar">'+(device.transport==='bluetooth'?'<button data-action="bt-command">Add key command</button>':'<button data-action="import-profile">Import profile</button><button data-action="learn">Learn a command</button><button data-action="search-profile">Find profile</button>')+'<button data-action="layout">Assign buttons</button></div><div class="list">'+device.commands.map(c=>'<div class="list-row"><span>'+escape(c.name)+'</span><button data-device="'+escape(device.id)+'" data-command="'+escape(c.name)+'" title="Send '+escape(c.name)+'">'+icon('Play')+'</button></div>').join('')+'</div></section>':''}</div>`);
   if(device){$('bt-type').value=device.type||'btkeyboard';if(device.transport==='ir')$('device-type').value=device.type||'Television';}
-  if(!device)$('transport').onchange=()=>{const bt=$('transport').value==='bluetooth';$('ir-fields').hidden=bt;$('bt-fields').hidden=!bt;$('manufacturer').required=!bt;$('model').required=!bt;};
+  if(!device){
+    const draft=state.draft;
+    if(draft){$('device-name').value=draft.name;$('manufacturer').value=draft.manufacturer;$('model').value=draft.model;$('device-type').value=draft.type;}
+    $('device-name').required=false;$('device-name').previousElementSibling.textContent='Name (optional)';
+    $('device-form').querySelector('[type=submit]').textContent='Continue';
+    $('transport').onchange=()=>{const bt=$('transport').value==='bluetooth';$('ir-fields').hidden=bt;$('bt-fields').hidden=!bt;$('manufacturer').required=!bt;$('model').required=!bt;$('device-name').required=bt;$('device-form').querySelector('[type=submit]').textContent=bt?'Save Bluetooth device':'Continue';};
+  }
   if(device?.transport==='bluetooth'){$('manufacturer').required=false;$('model').required=false;}
   $('device-form').onsubmit=async event=>{
-    event.preventDefault();try {
+    event.preventDefault();await busy(event.submitter,'Saving...',async()=>{
       const transport=device?.transport||$('transport').value;
+      if(!device&&transport==='ir'){
+        const manufacturer=$('manufacturer').value.trim(),model=$('model').value.trim();
+        const previous=state.draft?.manufacturer===manufacturer&&state.draft?.model===model?state.draft:{};
+        state.draft={...previous,name:$('device-name').value.trim()||`${manufacturer} ${model}`,manufacturer,model,type:$('device-type').value};
+        renderProfileChoice();return;
+      }
       const result=await mutate('devices',{action:device?'update':'create',deviceId:device?.id||'',name:$('device-name').value,
         transport,manufacturer:$('manufacturer').value,model:$('model').value,type:transport==='bluetooth'?$('bt-type').value:$('device-type').value,bdaddr:$('bt-address').value});
       await loadDevices();const saved=state.devices.find(d=>d.id===(result.deviceId||device?.id))||state.devices.find(d=>d.name===$('device-name').value);
       if(saved){writeLocal('harmony-device',saved.id);renderDeviceEditor(saved);}else renderDevices();notice('Device saved.');
-    }catch(error){notice(error.message,true);}
+    });
   };bindCommands($('content'));
+  if(device?.transport==='ir'){
+    const status=document.createElement('div');status.className='section';
+    status.innerHTML=`<p>${escape(deviceTestStatus(device))}</p>${state.config.deviceSetup?.[device.id]?.source?`<p class="profile-source">${escape(state.config.deviceSetup[device.id].source)}</p>`:''}<button data-action="test-device" ${device.commands.length?'':'disabled'}>Test a command</button>`;
+    $('device-form').after(status);
+  }
 }
 function renderLayout() {
   const device=state.editor||activeDevice();if(!device)return;
   let rows=structuredClone(state.config.layouts[device.id]||[]);
-  if(!rows.length)rows=controls.map(([slot,label,,aliases])=>({slot,label,command:device.commands.find(c=>aliases.includes(norm(c.name)))?.name})).filter(c=>c.command);
+  if(!state.config.layouts[device.id])rows=defaultLayout(device.commands);
   const draw=()=>{
     mount(`<div class="editor"><h2>Remote buttons</h2><form id="layout-form">${rows.map((r,i)=>`<div class="button-assignment"><select aria-label="Remote control" data-slot="${i}">${controls.map(([slot,label])=>`<option value="${slot}" ${slot===r.slot?'selected':''}>${label}</option>`).join('')}</select><div class="reorder"><input aria-label="Button label" data-label="${i}" value="${escape(r.label)}" maxlength="64"><select aria-label="Command" data-layout-command="${i}">${commandOptions(device.id,r.command)}</select><button type="button" data-move="${i}" data-direction="-1" class="icon-button" title="Move up" ${!i?'disabled':''}>${icon('ChevronUp')}</button><button type="button" data-move="${i}" data-direction="1" class="icon-button" title="Move down" ${i===rows.length-1?'disabled':''}>${icon('ChevronDown')}</button></div><button type="button" data-remove-button="${i}" class="icon-button" title="Remove assignment">${icon('Minus')}</button></div>`).join('')}<div class="toolbar"><button type="button" id="add-assignment">${icon('Plus')} Assign a button</button><button class="primary">Save buttons</button><button type="button" data-action="remote">Cancel</button></div></form></div>`);
     $('content').querySelectorAll('[data-slot]').forEach(e=>e.onchange=()=>rows[+e.dataset.slot].slot=e.value);
@@ -178,31 +214,147 @@ function renderLayout() {
     $('content').querySelectorAll('[data-label]').forEach(e=>e.oninput=()=>rows[+e.dataset.label].label=e.value);
     $('content').querySelectorAll('[data-layout-command]').forEach(e=>e.onchange=()=>rows[+e.dataset.layoutCommand].command=e.value);
     $('content').querySelectorAll('[data-move]').forEach(e=>e.onclick=()=>{const i=+e.dataset.move,j=i+(+e.dataset.direction);[rows[i],rows[j]]=[rows[j],rows[i]];draw();});
-    $('layout-form').onsubmit=async e=>{e.preventDefault();try{const config=structuredClone(state.config);config.layouts[device.id]=rows.filter(r=>r.command);await saveConfig(config);show('remote');notice('Remote buttons saved.');}catch(error){notice(error.message,true);}};
+    $('layout-form').onsubmit=async e=>{e.preventDefault();await busy(e.submitter,'Saving...',async()=>{const config=structuredClone(state.config);config.layouts[device.id]=rows.filter(r=>r.command);await saveConfig(config);writeLocal('harmony-device',device.id);writeLocal('harmony-activity','');show('remote');notice('Remote buttons saved.');});};
   };draw();
 }
-async function importProfile(text,path='profile.json',source='custom') {
+function setupProgress(step) {
+  return `<ol class="setup-progress" aria-label="Device setup">${['Device','Profile','Remote'].map((name,i)=>`<li ${i===step?'aria-current="step"':''}>${i+1}. ${name}</li>`).join('')}</ol>`;
+}
+function returnToDevice() {state.draft?renderProfileChoice():renderDeviceEditor(state.editor);}
+function renderProfileChoice() {
+  const draft=state.draft;
+  mount(`<div class="editor">${setupProgress(1)}<h2>${escape(draft.name)}</h2><div class="choice-list"><button class="primary" data-action="search-profile">${icon('Search')} Find a profile</button><button data-action="import-profile">${icon('Archive')} Import a profile file</button><button id="draft-learn">Learn from a remote</button></div>${draft.commands?.length?'<button id="resume-review">Review selected commands</button>':''}<div class="toolbar"><button id="setup-back">Back</button><button data-action="devices">Cancel setup</button></div></div>`);
+  $('setup-back').onclick=()=>renderDeviceEditor();
+  $('draft-learn').onclick=()=>renderDraftLearn();
+  if($('resume-review'))$('resume-review').onclick=()=>renderSetupReview();
+}
+function profilePayload(rows) {return rows.map(r=>`${String(r.name).replace(/[|"\r\n\\]/g,' ').slice(0,96).trim()}|${r.raw?'raw|'+r.raw:r.keycode}`).join('\n');}
+async function importProfile(text,path='profile.json',source='custom',back=returnToDevice,selection=null) {
   if(text.length>2*1024*1024)throw Error('Profile is too large.');
   const rows=window.harmonyParseProfile(text,source,path),supported=rows.filter(r=>r.keycode||r.raw);
   if(!supported.length)throw Error('No supported commands found in this file.');
-  const device=state.editor||activeDevice();
-  mount(`<div class="editor"><h2>Import commands</h2><p>${supported.length} supported commands. ${rows.length-supported.length} unsupported commands will not be imported.</p><form id="profile-form"><div class="list">${supported.map((r,i)=>`<label class="check-label"><input type="checkbox" name="command" value="${i}" checked>${escape(r.name)}</label>`).join('')}</div><div class="toolbar"><button class="primary">Save selected commands</button><button type="button" data-action="devices">Cancel</button></div></form></div>`);
-  $('profile-form').onsubmit=async event=>{event.preventDefault();try{
-    const selected=[...new FormData(event.target).getAll('command')].map(i=>supported[+i]);
-    const payload=selected.map(r=>`${String(r.name).replace(/[|"\r\n\\]/g,' ').slice(0,96)}|${r.raw?'raw|'+r.raw:r.keycode}`).join('\n');
-    await mutate('commands/import',{deviceId:device.id,payload});await loadDevices();state.editor=state.devices.find(d=>d.id===device.id);renderDeviceEditor(state.editor);notice('Commands saved locally.');
-  }catch(error){notice(error.message,true);}};
+  const device=state.editor,basics=new Set(defaultLayout(supported).map(b=>b.command));
+  supported.sort((a,b)=>Number(basics.has(b.name))-Number(basics.has(a.name)));
+  const selected=new Set(selection??supported.flatMap((r,i)=>supported.length<=40||basics.has(r.name)?[i]:[]));
+  mount(`<div class="editor">${state.draft?setupProgress(1):''}<h2>Choose commands</h2><p class="profile-source">${escape(profileTitle(path))}</p><small>${supported.length} available${rows.length>supported.length?`; ${rows.length-supported.length} unsupported, excluded`:''}</small><form id="profile-form">${field('Filter commands','profile-filter','','search')}<div class="toolbar selection-tools"><button type="button" data-select="basic">Basic controls</button><button type="button" data-select="all">Select all</button><button type="button" data-select="none">Clear</button></div><div id="profile-commands" class="command-selection">${supported.map((r,i)=>`<label class="check-label"><input type="checkbox" name="command" value="${i}" ${selected.has(i)?'checked':''}>${escape(r.name)}</label>`).join('')}</div><div class="toolbar setup-actions"><p id="selection-count" role="status"></p><button class="primary" id="accept-profile">${state.draft?'Review remote':'Save selected commands'}</button><button type="button" id="profile-back">Back</button></div></form></div>`);
+  window.scrollTo(0,0);
+  const update=()=>{$('selection-count').textContent=`${selected.size} commands selected`;$('accept-profile').disabled=!selected.size;};
+  $('profile-commands').onchange=e=>{e.target.checked?selected.add(+e.target.value):selected.delete(+e.target.value);update();};
+  $('profile-filter').oninput=e=>{$('profile-commands').querySelectorAll('label').forEach((row,i)=>row.hidden=!supported[i].name.toLowerCase().includes(e.target.value.toLowerCase()));};
+  $('content').querySelectorAll('[data-select]').forEach(button=>button.onclick=()=>{
+    selected.clear();supported.forEach((r,i)=>{if(button.dataset.select==='all'||button.dataset.select==='basic'&&basics.has(r.name))selected.add(i);});
+    $('profile-commands').querySelectorAll('input').forEach(input=>input.checked=selected.has(+input.value));update();
+  });
+  $('profile-back').onclick=back;update();
+  $('profile-form').onsubmit=async event=>{event.preventDefault();await busy(event.submitter,'Saving...',async()=>{
+    const commands=supported.filter((r,i)=>selected.has(i));
+    if(state.draft){
+      const layout=selection?state.draft.layout.filter(b=>commands.some(c=>c.name===b.command)):defaultLayout(commands);
+      Object.assign(state.draft,{commands,source:path,layout,reviewBack:()=>importProfile(text,path,source,back,[...selected])});renderSetupReview();return;
+    }
+    await mutate('commands/import',{deviceId:device.id,payload:profilePayload(commands)});await loadDevices();state.editor=state.devices.find(d=>d.id===device.id);renderDeviceEditor(state.editor);notice('Commands saved locally.');
+  });};
 }
-function renderImport() {mount('<div class="editor"><h2>Import a profile</h2><label for="profile-file">Profile file</label><input id="profile-file" type="file" accept=".json,.ir,.csv,.conf,.xml,.txt,.girr"><div class="toolbar"><button data-action="devices">Cancel</button></div></div>');$('profile-file').onchange=async()=>{try{const file=$('profile-file').files[0];if(!file)return;if(file.size>2*1024*1024)throw Error('Profile exceeds the 2 MB import limit.');await importProfile(await file.text(),file.name);}catch(error){notice(error.message,true);}};}
-function renderSearch() {
-  mount(`<div class="editor"><h2>Find an IR profile</h2><form id="search-form">${field('Brand and model','profile-query',state.editor?.manufacturer+' '+state.editor?.model,'search','required')}<div class="toolbar"><button class="primary">Search</button><button type="button" data-action="devices">Cancel</button></div></form><div id="profile-results" class="list"></div></div>`);
-  $('search-form').onsubmit=async event=>{event.preventDefault();try{
-    notice('Searching community profiles...');const response=await fetch('https://api.github.com/repos/Lucaslhm/Flipper-IRDB/git/trees/main?recursive=1');if(!response.ok)throw Error('Community search is unavailable. Import a profile file instead.');
-    const index=await response.json(),tokens=$('profile-query').value.toLowerCase().split(/\s+/).filter(Boolean);
-    const files=(index.tree||[]).filter(f=>f.type==='blob'&&f.path.endsWith('.ir')&&tokens.every(t=>f.path.toLowerCase().includes(t))).slice(0,40);
-    $('profile-results').innerHTML=files.map((f,i)=>`<div class="list-row"><span class="text">${escape(f.path)}</span><button data-profile="${i}">Choose</button></div>`).join('')||'<p>No exact match. Try the brand or a related model, or import a profile file.</p>';
-    $('profile-results').querySelectorAll('[data-profile]').forEach(b=>b.onclick=async()=>{try{const path=files[+b.dataset.profile].path;const r=await fetch('https://raw.githubusercontent.com/Lucaslhm/Flipper-IRDB/main/'+path.split('/').map(encodeURIComponent).join('/'));if(!r.ok)throw Error('Profile download failed.');await importProfile(await r.text(),path,'flipper');notice('Select the commands to save.');}catch(error){notice(error.message,true);}});notice('Search complete.');
-  }catch(error){notice(error.message,true);}};
+function renderImport() {
+  mount(`<div class="editor">${state.draft?setupProgress(1):''}<h2>Import a profile</h2><label for="profile-file">Profile file (up to 2 MB)</label><input id="profile-file" type="file" accept=".json,.ir,.csv,.conf,.xml,.txt,.girr"><small>Flipper IR, Pronto, LIRC, GIRR, CSV or JSON</small><div class="toolbar"><button id="import-back">Back</button></div></div>`);
+  $('import-back').onclick=returnToDevice;
+  $('profile-file').onchange=async event=>{const input=event.target;try{const file=input.files[0];if(!file)return;if(file.size>2*1024*1024)throw Error('Profile exceeds the 2 MB import limit.');const text=await file.text();if(input.isConnected)await importProfile(text,file.name,'custom',renderImport);}catch(error){if(input.isConnected)notice(error.message,true);}};
+}
+const profileNorm=value=>String(value).toLowerCase().replace(/[^a-z0-9]/g,'');
+function profileTitle(path) {return path.split('/').pop().replace(/\.ir$/i,'').replace(/_/g,' ');}
+function findProfiles(tree,query,device) {
+  const tokens=query.split(/\s+/).map(profileNorm).filter(Boolean),model=profileNorm(device.model),family=(device.model.match(/^[a-z]+/i)||[''])[0].toLowerCase();
+  const category={Audio:/^(Audio|SoundBars|Speakers|Home_Theater)/i,Television:/^(TVs|Projectors)/i,'Media Player':/^(DVD|Blu|Streaming|Set_Top|Media)/i}[device.type];
+  return tree.filter(f=>f.type==='blob'&&f.path.endsWith('.ir')&&tokens.every(t=>profileNorm(f.path).includes(t)))
+    .map(f=>({...f,exact:!!model&&[model,profileNorm(device.manufacturer+device.model)].includes(profileNorm(profileTitle(f.path))),family:family.length>1&&profileNorm(profileTitle(f.path)).includes(family),category:!!category&&category.test(f.path)}))
+    .sort((a,b)=>Number(b.exact)-Number(a.exact)||Number(b.family)-Number(a.family)||Number(b.category)-Number(a.category)||a.path.localeCompare(b.path));
+}
+let profileIndex;
+function renderSearch(query=null) {
+  const device=state.draft||state.editor;
+  mount(`<div class="editor">${state.draft?setupProgress(1):''}<h2>Find a profile</h2><form id="search-form">${field('Brand and model','profile-query',query??`${device.manufacturer} ${device.model}`,'search','required')}<div class="toolbar"><button class="primary">Search</button><button type="button" id="search-back">Back</button></div></form><div id="profile-results" class="list"></div></div>`);
+  $('search-back').onclick=returnToDevice;
+  const results=$('profile-results');
+  $('search-form').onsubmit=async event=>{event.preventDefault();const query=$('profile-query').value.trim();await busy(event.submitter,'Searching...',async()=>{
+    results.textContent='';
+    if(!profileIndex){const response=await fetch('https://api.github.com/repos/Lucaslhm/Flipper-IRDB/git/trees/main?recursive=1',{signal:AbortSignal.timeout(15000)});if(!response.ok)throw Error('Community search is unavailable. Go back to import a profile file.');const index=await response.json();if(index.truncated)throw Error('Community index is incomplete. Import a profile file instead.');profileIndex=index.tree||[];}
+    if(!results.isConnected)return;
+    const files=findProfiles(profileIndex,query,device);let limit=20;
+    const draw=()=>{
+      results.innerHTML=`<p>${files.length?`${files.length} ${files.length===1?'profile':'profiles'}. Compatibility needs a device test.`:'No matching profile.'}</p>${!files.some(f=>f.exact)&&profileNorm(query)!==profileNorm(device.manufacturer)?'<button id="brand-search">Show other '+escape(device.manufacturer)+' profiles</button>':''}${files.slice(0,limit).map((f,i)=>`<div class="list-row"><div class="text"><strong>${escape(profileTitle(f.path))}</strong><small>${f.exact?'Model name matches':'Other model / generic profile'}</small><small>${escape(f.path.split('/').slice(0,-1).join(' / ').replace(/_/g,' '))}</small></div><button data-profile="${i}" aria-label="Choose ${escape(profileTitle(f.path))}">Choose</button></div>`).join('')}${files.length>limit?`<div class="toolbar"><button id="more-profiles">Show more (${files.length-limit} remaining)</button></div>`:''}`;
+      if($('brand-search'))$('brand-search').onclick=()=>{$('profile-query').value=device.manufacturer;$('search-form').requestSubmit($('search-form').querySelector('button.primary'));};
+      if($('more-profiles'))$('more-profiles').onclick=()=>{limit+=20;draw();};
+      results.querySelectorAll('[data-profile]').forEach(button=>button.onclick=()=>busy(button,'Loading...',async()=>{
+        const path=files[+button.dataset.profile].path;
+        const response=await fetch('https://raw.githubusercontent.com/Lucaslhm/Flipper-IRDB/main/'+path.split('/').map(encodeURIComponent).join('/'),{signal:AbortSignal.timeout(15000)});
+        if(!response.ok)throw Error('Profile download failed. Choose another profile or import a file.');
+        const text=await response.text();if(results.isConnected)await importProfile(text,path,'flipper',()=>renderSearch(query));
+      }));
+    };draw();
+  });};
+}
+function renderDraftLearn() {
+  const draft=state.draft;
+  mount(`<div class="editor">${setupProgress(1)}<h2>Learn a command</h2><form id="draft-learn-form">${field('Command name','draft-command','','text','required maxlength="96"')}<div class="toolbar"><button class="primary">Capture signal</button><button type="button" id="learn-back">Back</button></div></form><div id="learned-commands" class="list"></div><button id="review-learned" ${draft.commands?.length?'':'disabled'}>Review remote</button></div>`);
+  const draw=()=>{$('learned-commands').textContent=(draft.commands||[]).map(c=>c.name).join(', ');$('review-learned').disabled=!draft.commands?.length;};draw();
+  $('learn-back').onclick=returnToDevice;$('review-learned').onclick=()=>renderSetupReview();
+  $('draft-learn-form').onsubmit=async event=>{event.preventDefault();const name=$('draft-command').value.trim(),form=event.target;
+    if(draft.commands?.some(c=>c.name===name))return notice('That command name is already in this profile.',true);
+    await busy(event.submitter,'Listening...',async()=>{const result=await api('commands/learn',{});if(!form.isConnected)return;
+      if(!result.raw)throw Error('No replayable signal captured. Try again.');
+      draft.commands||=[];draft.commands.push({name,raw:result.raw});draft.source=draft.source&&draft.source!=='Learned from remote'?'Imported profile and learned commands':'Learned from remote';draft.layout=defaultLayout(draft.commands);draft.reviewBack=renderDraftLearn;draw();notice('Command captured.');
+    });
+  };
+}
+function renderSetupReview() {
+  const draft=state.draft;
+  const assigned=new Set(draft.layout.map(b=>b.slot));
+  const row=([slot,label,image])=>`<label class="review-control" for="review-${slot}"><span>${image?icon(image):''}${label}</span><select id="review-${slot}" data-review="${slot}"><option value="">Not on remote</option>${draft.commands.map(c=>`<option value="${escape(c.name)}" ${draft.layout.some(b=>b.slot===slot&&b.command===c.name)?'selected':''}>${escape(c.name)}</option>`).join('')}</select></label>`;
+  mount(`<div class="editor">${setupProgress(2)}<h2>Review ${escape(draft.name)}</h2><p>${draft.commands.length} commands - not tested</p><small class="profile-source">${escape(profileTitle(draft.source||''))}</small><form id="setup-review"><div class="review-controls">${controls.filter(c=>assigned.has(c[0])).map(row).join('')}</div><details><summary>More remote buttons</summary><div class="review-controls">${controls.filter(c=>!assigned.has(c[0])).map(row).join('')}</div></details><div class="toolbar"><button class="primary" name="finish" value="test">Save and test</button><button name="finish" value="later">Save without testing</button><button type="button" id="setup-review-back">Back</button></div></form></div>`);
+  window.scrollTo(0,0);$('setup-review-back').onclick=draft.reviewBack||returnToDevice;
+  $('content').querySelectorAll('[data-review]').forEach(input=>input.onchange=()=>{
+    draft.layout=draft.layout.filter(b=>b.slot!==input.dataset.review);
+    if(input.value)draft.layout.push({slot:input.dataset.review,label:controls.find(c=>c[0]===input.dataset.review)[1],command:input.value});
+  });
+  $('setup-review').onsubmit=async event=>{event.preventDefault();const form=event.target,finish=event.submitter.value;
+    // Lock both save buttons: a second click must not create a second device.
+    if(form.dataset.saving)return;form.dataset.saving='true';
+    form.querySelectorAll('button').forEach(b=>b.disabled=true);notice('Saving device...');
+    let saved=false;
+    try {
+      const payload={action:'create-profile',transport:'ir',name:draft.name,manufacturer:draft.manufacturer,model:draft.model,type:draft.type,payload:profilePayload(draft.commands),layout:draft.layout,source:draft.source||''};
+      if(new TextEncoder().encode(JSON.stringify(payload)).length>500000)throw Error('Selected commands exceed the hub request limit. Choose fewer commands.');
+      // Keep the create result even if refreshing the inventory fails.
+      const result=await api('devices',{...payload,revision:state.config.revision});saved=true;state.draft=null;
+      writeLocal('harmony-device',result.deviceId);writeLocal('harmony-activity','');
+      state.config=await api('configuration');await loadDevices();
+      const device=state.devices.find(d=>d.id===result.deviceId);
+      if(finish==='test')renderDeviceTest(device);else{show('remote');notice('Device saved. No commands were sent.');}
+    }catch(error){
+      notice(saved?'Device saved, but the view could not refresh. Reconnect to open it.':error.message,true);
+      if(!saved&&form.isConnected){delete form.dataset.saving;form.querySelectorAll('button').forEach(b=>b.disabled=false);}
+    }
+  };
+}
+function renderDeviceTest(device) {
+  if(!device)return;
+  state.editor=device;
+  const preferred=matchCommand(device.commands,['volumedown','voldown','voldn']);
+  mount(`<div class="editor"><h2>Test ${escape(device.name)}</h2><p>${escape(deviceTestStatus(device))}</p><label for="test-command">Command</label><select id="test-command"><option value="">Choose a command</option>${device.commands.map(c=>`<option ${c.name===preferred?.name?'selected':''}>${escape(c.name)}</option>`).join('')}</select><div class="toolbar"><button id="send-test" class="primary">Send once</button></div><div id="test-response" hidden><p>Did the device respond?</p><div class="toolbar"><button id="test-yes">Yes</button><button id="test-no">No</button></div></div><div class="toolbar"><button data-action="open-device" data-id="${escape(device.id)}">Open remote</button><button data-action="edit-device" data-id="${escape(device.id)}">Back to device</button></div></div>`);
+  const select=$('test-command'),response=$('test-response');let sent='';
+  $('send-test').disabled=!select.value;select.onchange=()=>{sent='';response.hidden=true;$('send-test').disabled=!select.value;};
+  $('send-test').onclick=event=>busy(event.currentTarget,'Sending...',async()=>{
+    response.hidden=true;sent='';const command=select.value;select.disabled=true;
+    try{const op=await api('commands/send',{deviceId:device.id,command,transport:'ir',mode:'tap'});const result=await operation(op.id);
+      if(!response.isConnected)return;if(result.state!=='completed')throw Error('Command was cancelled.');
+      sent=command;response.hidden=false;notice('Sent to the hub.');
+    }finally{select.disabled=false;}
+  });
+  for(const [id,status] of [['test-yes','responded'],['test-no','no-response']])$(id).onclick=event=>busy(event.currentTarget,'Saving...',async()=>{
+    if(!sent)return;const command=sent;sent='';
+    try{const config=structuredClone(state.config);config.deviceSetup||={};config.deviceSetup[device.id]={...config.deviceSetup[device.id],status,testedCommand:command};await saveConfig(config);renderDeviceEditor(device);notice(status==='responded'?`${command} confirmed. Other commands are not yet tested.`:'No response recorded. Check the profile and try again.');}
+    catch(error){sent=command;throw error;}
+  });
 }
 function updateLearnSave() {
   const mode=$('learn-mode').value;
@@ -245,16 +397,23 @@ function renderActivityEditor(activity=null) {
     $('activity-form').onsubmit=async e=>{e.preventDefault();try{const config=structuredClone(state.config),i=config.activities.findIndex(a=>a.id===value.id);if(i>=0)config.activities[i]=value;else config.activities.push(value);await saveConfig(config);show('activities');notice('Activity saved. Use its play button for an explicit test run.');}catch(error){notice(error.message,true);}};
   };draw();
 }
+function renderMqttStatus(mqtt) {
+  const element=$('mqtt-status');if(!element)return;
+  const labels={connected:'MQTT connected',connecting:'Connecting to MQTT...',waiting_for_hub:'Waiting for the hub service...',disconnected:'MQTT disconnected',disabled:'MQTT disabled'};
+  element.textContent=mqtt.enabled?(labels[mqtt.status?.state]||'MQTT is starting...'):'MQTT disabled';
+  if(mqtt.enabled&&mqtt.status?.error)element.textContent+=': '+mqtt.status.error;
+}
 async function renderSettings() {
   mount(`<div class="section"><h2>Appearance</h2><label for="theme">Theme</label><select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></div>
     ${owner()?'<section class="section"><h2>Controllers</h2><div id="controllers">Loading paired controllers...</div></section><section class="section"><h2>Backups</h2><div class="toolbar"><button data-action="export-portable">Export setup</button><button data-action="export-full">Sensitive hub backup</button></div><label for="restore-file">Restore setup</label><input id="restore-file" type="file" accept=".json"></section><section class="section"><h2>Home Assistant</h2><form id="mqtt-form"><label class="check-label"><input id="mqtt-enabled" type="checkbox">Enable MQTT</label>'+field('Broker','mqtt-host')+field('Port','mqtt-port','1883','number','min="1" max="65535"')+field('Username','mqtt-user')+field('Password','mqtt-password','','password')+'<div class="toolbar"><button class="primary">Save integration</button></div></form></section><section class="section"><h2>Recovery</h2><p>USB recovery remains available through the desktop tool. A stock factory reset can remove this installation.</p><div class="toolbar"><button data-action="reboot">Reboot hub</button></div></section><details><summary>Advanced</summary><section class="section"><h2>Software update</h2><label for="update-file">Signed local release bundle</label><input id="update-file" type="file" accept=".json"><div class="toolbar"><button data-action="update" disabled id="install-update">Install verified update</button></div><p id="update-status"></p></section><section class="section"><h2>Network</h2><form id="wifi-form">'+field('Wi-Fi name','wifi-ssid')+field('Wi-Fi password','wifi-password','','password')+'<div class="toolbar"><button class="primary">Change Wi-Fi</button><button type="button" data-action="confirm-wifi">Confirm new connection</button></div></form></section><p class="warning">This connection uses local HTTP. Pairing does not encrypt traffic. Do not expose this hub to the internet.</p><p>Fresh setup is experimental until the separate blank-hub recovery test passes.</p></details>':'<p>Only the owner can change settings, pair controllers or export backups.</p>'}`);
+  $('mqtt-form')?.insertAdjacentHTML('beforebegin','<p id="mqtt-status" role="status">Checking MQTT connection...</p>');
   $('theme').value=readLocal('harmony-theme','system');$('theme').onchange=e=>{document.documentElement.dataset.theme=e.target.value;writeLocal('harmony-theme',e.target.value);};
   if(!owner()){$('content').insertAdjacentHTML('beforeend','<div class="toolbar"><button class="primary" data-action="full-access">Get full access with Pair button</button></div>');return;}
   $('restore-file').onchange=async()=>{try{const file=$('restore-file').files[0];if(!file)return;if(file.size>500000)throw Error('Backup exceeds the browser restore limit. Use the desktop installer.');const backup=JSON.parse(await file.text());if(!confirm('Replace the local setup with this backup? Existing native activities are restored only from the supplied backup.'))return;await mutate('backups/restore',{backup});await loadDevices();notice('Setup restored.');}catch(error){notice(error.message,true);}};
-  $('mqtt-form').onsubmit=async e=>{e.preventDefault();try{await api('integrations/mqtt',{enabled:$('mqtt-enabled').checked,host:$('mqtt-host').value,port:Number($('mqtt-port').value),username:$('mqtt-user').value,password:$('mqtt-password').value});notice('MQTT settings saved.');}catch(error){notice(error.message,true);}};
+  $('mqtt-form').onsubmit=async e=>{e.preventDefault();try{const mqtt=await api('integrations/mqtt',{enabled:$('mqtt-enabled').checked,host:$('mqtt-host').value,port:Number($('mqtt-port').value),username:$('mqtt-user').value,password:$('mqtt-password').value});renderMqttStatus(mqtt);notice('MQTT settings saved.');}catch(error){notice(error.message,true);}};
   $('wifi-form').onsubmit=async e=>{e.preventDefault();try{await api('network/wifi',{ssid:$('wifi-ssid').value,password:$('wifi-password').value});notice('Trying the new network. Reconnect and confirm it within 90 seconds, or the hub will restore the old network.');}catch(error){notice(error.message,true);}};
   $('update-file').onchange=()=>{$('install-update').disabled=!$('update-file').files.length;};
-  try{const mqtt=await api('integrations/mqtt');if(state.view!=='settings')return;$('mqtt-enabled').checked=!!mqtt.enabled;$('mqtt-host').value=mqtt.broker?.host||'';$('mqtt-port').value=mqtt.broker?.port||1883;$('mqtt-user').value=mqtt.broker?.username||'';}catch(error){notice(error.message,true);}
+  try{const mqtt=await api('integrations/mqtt');if(state.view!=='settings')return;renderMqttStatus(mqtt);$('mqtt-enabled').checked=!!mqtt.enabled;$('mqtt-host').value=mqtt.broker?.host||'';$('mqtt-port').value=mqtt.broker?.port||1883;$('mqtt-user').value=mqtt.broker?.username||'';}catch(error){notice(error.message,true);}
   try{const controllers=await api('controllers');if(state.view!=='settings')return;$('controllers').innerHTML=controllers.map(c=>`<div class="list-row"><div class="text"><strong>${escape(c.name)}</strong><small>${escape(c.role)}</small></div>${c.id===state.session.id?'':`<button data-action="${c.role==='pending'?'approve':'revoke'}" data-id="${escape(c.id)}">${c.role==='pending'?'Approve':'Revoke'}</button>`}</div>`).join('');}catch(error){notice(error.message,true);}
 }
 async function loadDevices() {
@@ -262,7 +421,8 @@ async function loadDevices() {
   const bluetooth=await api('bluetooth/devices');state.devices.push(...(bluetooth.devices||[]).map(d=>({...d,transport:'bluetooth'})));
 }
 function show(view) {
-  stopHold(false);state.editor=null;state.view=['remote','devices','activities','settings'].includes(view)?view:'remote';
+  if(state.draft&&!confirm('Discard this unsaved device setup?'))return;
+  stopHold(false);state.editor=null;state.draft=null;state.view=['remote','devices','activities','settings'].includes(view)?view:'remote';
   if(location.hash!=='#'+state.view)history.replaceState(null,'','#'+state.view);
   $('title').textContent={remote:'Remote',devices:'Devices',activities:'Activities',settings:'Settings'}[state.view];
   $('navigation').querySelectorAll('[data-view]').forEach(a=>{if(a.dataset.view===state.view)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});
@@ -296,17 +456,20 @@ document.addEventListener('click',async event=>{
   const button=event.target.closest('[data-action]');if(!button)return;
   try {
     const action=button.dataset.action;
+    if(action==='devices'&&state.editor&&button.textContent==='Cancel'&&!button.closest('#device-form')){renderDeviceEditor(state.editor);return;}
     if(['remote','devices','activities','settings'].includes(action)){show(action);return;}
     if(action==='refresh'){await boot();return;}
     if(action==='cancel-pair'){await api('controllers/cancel',{});await boot();return;}
     if(action==='full-access'){await api('controllers/upgrade',{});await boot();return;}
     if(action==='drawer')drawer();
-    else if(action==='add-device')renderDeviceEditor();
+    else if(action==='add-device'){state.draft=null;renderDeviceEditor();}
     else if(action==='open-device'){writeLocal('harmony-activity','');writeLocal('harmony-device',button.dataset.id);show('remote');}
     else if(action==='edit-device')renderDeviceEditor(state.devices.find(d=>d.id===button.dataset.id));
     else if(action==='layout')renderLayout();
     else if(action==='import-profile')renderImport();
     else if(action==='search-profile')renderSearch();
+    else if(action==='test-device')renderDeviceTest(state.editor);
+    else if(action==='device-back')renderDeviceEditor(state.editor);
     else if(action==='learn')renderLearn();
     else if(action==='delete-device'){if(confirm('Delete this device from the hub?')){await mutate('devices',{action:'delete',deviceId:state.editor.id,transport:state.editor.transport});await loadDevices();show('devices');}}
     else if(action==='capture'){const result=await api('commands/learn',{});$('learn-raw').value=result.raw||'';$('learn-mode').value=result.mode||'raw';$('learn-protocol').value=result.protocolId||'2';$('learn-code').value=result.keycode||result.nec||'';$('capture-result').textContent=result.analysis||'Capture received. Verify the signal before saving.';updateLearnSave();}
@@ -338,7 +501,8 @@ async function installUpdate() {
   await api('updates/apply',{});notice('Signed release verified. The hub is restarting with a rollback check.');
 }
 window.addEventListener('hashchange',()=>{const view=location.hash.slice(1);if(state.config&&['remote','devices','activities','settings'].includes(view))show(view);});
+$('navigation').addEventListener('click',event=>{const link=event.target.closest('[data-view]');if(link&&state.config){event.preventDefault();show(link.dataset.view);}});
 $('connection').addEventListener('click',()=>boot());
-async function pollSession(){try{const session=await api('session');if(!state.session||session.role!==state.session.role||session.buttonPending!==state.session.buttonPending){await boot();}}catch{}finally{clearTimeout(sessionTimer);sessionTimer=setTimeout(pollSession,state.session?.role==='pending'||state.session?.buttonPending?1500:15000);}}
+async function pollSession(){try{const session=await api('session');if(!state.session||session.role!==state.session.role||session.buttonPending!==state.session.buttonPending){await boot();}else if(owner()&&state.view==='settings')renderMqttStatus(await api('integrations/mqtt'));}catch{if($('mqtt-status'))$('mqtt-status').textContent='MQTT connection status unavailable';}finally{clearTimeout(sessionTimer);sessionTimer=setTimeout(pollSession,state.session?.role==='pending'||state.session?.buttonPending?1500:15000);}}
 sessionTimer=setTimeout(pollSession,1500);
 boot();

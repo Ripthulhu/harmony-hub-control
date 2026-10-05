@@ -47,9 +47,17 @@ A normal reboot activates the new service and listener restrictions.
 - **Activities:** choose power/input actions, delays and remote button assignments.
 - **Settings:** approve controllers, export backups, change Wi-Fi and configure optional MQTT/Home Assistant.
 
+For Home Assistant remote commands, long presses and MQTT discovery, see
+[Home Assistant setup](docs/HOME_ASSISTANT.md).
+
 A tap sends one press. Holding an IR button uses native press/hold/release.
 Releasing, leaving the page or losing the connection stops it. IR state is an
 estimate; a successful send does not prove that the TV responded.
+
+To add an IR device, enter its brand and model, find or import a profile, then
+review its remote buttons. Nothing is saved until the final step. Choose
+**Save and test** to send a command yourself, or **Save without testing** to
+leave testing for later. A matching profile name is not proof of compatibility.
 
 Choose **Keep existing setup** on first use. Supported local devices can be
 edited; original native activity configurations are preserved, not silently

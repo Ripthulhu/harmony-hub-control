@@ -116,8 +116,43 @@ assert.equal(canSave('keycode','Volume up','','0020',''),false);
 assert.equal(canSave('keycode','Volume up','','0020'),true);
 assert.equal(canSave('nec',' ','','20DF40BF'),false);
 let routed='settings';ui.state={config:{}};ui.location={hash:'#main'};ui.show=view=>{routed=view;};
+inputs.navigation={addEventListener:(name,handler)=>ui.onNavigation=handler};
 ui.window={addEventListener:(name,handler)=>ui.onHash=handler};
 vm.runInContext(source.slice(source.indexOf("window.addEventListener('hashchange'"),source.indexOf("$('connection').addEventListener")),ui);
 ui.onHash();assert.equal(routed,'settings');
 ui.location.hash='#devices';ui.onHash();assert.equal(routed,'devices');
+ui.onNavigation({target:{closest:()=>({dataset:{view:'devices'}})},preventDefault(){}});assert.equal(routed,'devices');
 console.log('Power labels, imported device types, activity fields, manual codes and keyboard skip navigation passed');
+
+vm.runInContext("state.devices[0].commands=['VOL+','VOL-','UP_ARROW','DN_ARROW','LEFT_ARROW','RIGHT_ARROW','ENTER','HOME_MENU','PLAY PAUSE','INPUT-','INPUT+'].map(name=>({name}))",remote);
+const layout=JSON.parse(vm.runInContext('JSON.stringify(defaultLayout(activeDevice().commands))',remote));
+for(const [slot,name] of [['volumeup','VOL+'],['volumedown','VOL-'],['up','UP_ARROW'],['down','DN_ARROW'],['menu','HOME_MENU'],['play','PLAY PAUSE'],['input','INPUT+']])assert.equal(layout.find(b=>b.slot===slot).command,name);
+vm.runInContext('state.config.layouts={tv:[]}',remote);
+assert.equal(vm.runInContext('remoteButton("volumeup",activeDevice())',remote),'','explicitly hidden controls must stay hidden');
+vm.runInContext(source.slice(source.indexOf('const profileNorm='),source.indexOf('let profileIndex;')),remote);
+const matches=vm.runInContext(`findProfiles([
+  {type:'blob',path:'Air_Conditioners/Pioneer/Pioneer_AC.ir'},
+  {type:'blob',path:'Audio_and_Video_Receivers/Pioneer/Pioneer_VSX_LX52.ir'},
+  {type:'blob',path:'_Converted_/Pronto/P/Pioneer/VSX-52.ir'}
+],'Pioneer',{manufacturer:'Pioneer',model:'VSX-LX52',type:'Audio'})`,remote);
+assert.equal(matches[0].exact,true);assert.equal(matches.length,3);
+assert.equal(vm.runInContext(`findProfiles([{type:'blob',path:'SoundBars/Bose/Bose_Solo_5.ir'}],'Bose Solo-5',{manufacturer:'Bose',model:'Solo 5',type:'Audio'}).length`,remote),1);
+console.log('Profile ranking, punctuation-insensitive search, receiver aliases and hidden controls passed');
+
+const setupCode=source.slice(source.indexOf('function renderSetupReview()'),source.indexOf('function renderDeviceTest('));
+for(const failRefresh of [false,true]){
+  const saveCalls=[],fields={'setup-review-back':{},'content':{querySelectorAll:()=>[]},'setup-review':{}};
+  const setupState={config:{revision:7},devices:[{id:'2'}],draft:{name:'Receiver',manufacturer:'Pioneer',model:'VSX-LX52',type:'Audio',commands:[{name:'VOL+'}],layout:[],source:'candidate.ir'}};
+  const context=vm.createContext({state:setupState,$:id=>fields[id],controls:[],escape:String,setupProgress:()=>'',profileTitle:String,profilePayload:()=>'',mount(){},returnToDevice(){},notice(){},TextEncoder,
+    window:{scrollTo(){}},writeLocal(){},show(){},loadDevices:async()=>{},api:async(path,body)=>{saveCalls.push({path,body});if(path==='devices')return {deviceId:'2'};if(failRefresh)throw Error('offline');return {revision:8};}});
+  vm.runInContext(setupCode+'\nrenderSetupReview();',context);
+  const buttons=[{},{}],form={dataset:{},isConnected:true,querySelectorAll:()=>buttons};
+  const event={target:form,submitter:{value:'later'},preventDefault(){}};
+  const saving=fields['setup-review'].onsubmit(event);
+  await fields['setup-review'].onsubmit(event);await saving;
+  assert.equal(saveCalls.filter(c=>c.path==='devices').length,1);
+  assert.equal(saveCalls[0].body.action,'create-profile');assert.equal(saveCalls[0].body.revision,7);
+  assert.equal(setupState.draft,null,'a saved draft must never be resubmitted after a refresh failure');
+  assert.ok(!saveCalls.some(c=>c.path==='commands/send'),'saving never transmits');
+}
+console.log('Single-save setup, double-submit suppression and refresh-failure handling passed');
