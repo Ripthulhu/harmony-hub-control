@@ -1492,18 +1492,78 @@ static int send_ir_command_action_ex(const char *device_id, const char *command,
     return rc;
 }
 
-static void capture_ir_command_action(char *out, size_t outlen) {
-    char hub_id[64];
-    char esc_id[128], cmd[512];
-    if (!load_hub_id(hub_id, sizeof(hub_id))) {
-        snprintf(out, outlen, "Hub ID is missing. Re-run the root tool or reinstall with the numeric Hub ID printed as hub_id=...");
-        return;
+#define IR_CAPTURE_FINAL_GAP_US 20000
+#define IR_CAPTURE_FRAME_GAP_US 7000
+#define IR_CAPTURE_MAX_PAIRS 512
+
+static int timing_close(unsigned int a, unsigned int b) {
+    unsigned int larger = a > b ? a : b, diff = a > b ? a - b : b - a;
+    return diff * 100 <= larger * 15;
+}
+
+/* HAL ir.cap binary: one status byte, then big-endian 16-bit words:
+   first mark, carrier in 250 Hz units, first period, then (mark, period)
+   pairs in microseconds. A word with bit 15 set ends the capture. */
+static int ir_capture_to_raw(const unsigned char *data, size_t len, char *out, size_t outlen) {
+    static unsigned int marks[IR_CAPTURE_MAX_PAIRS], spaces[IR_CAPTURE_MAX_PAIRS];
+    unsigned int words = len > 1 ? (unsigned int)((len - 1) / 2) : 0, count = 0, i, frame = 0;
+    unsigned long freq;
+    size_t pos;
+    #define CAPTURE_WORD(n) ((unsigned int)((data[1 + 2 * (n)] << 8) | data[2 + 2 * (n)]))
+    if (words < 3) return -1;
+    freq = (unsigned long)CAPTURE_WORD(1) * 250;
+    if (freq < 20000 || freq > 60000) return -1;
+    /* Word indexes of each pair: (0, 2), then (3, 4), (5, 6), ... */
+    for (i = 0; i < words && count < IR_CAPTURE_MAX_PAIRS; i = (i == 0 ? 3 : i + 2)) {
+        unsigned int mark = CAPTURE_WORD(i), period_index = (i == 0 ? 2 : i + 1), period;
+        if (!mark || (mark & 0x8000)) break;
+        period = period_index < words ? CAPTURE_WORD(period_index) : 0x8000;
+        marks[count] = mark;
+        if (period & 0x8000) { spaces[count++] = IR_CAPTURE_FINAL_GAP_US; break; }
+        if (period <= mark) return -1;
+        spaces[count++] = period - mark;
     }
-    shell_escape_single(hub_id, esc_id, sizeof(esc_id));
-    snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hbus '%s' ir.cap '{\"hbusData\":{\"timeout\":15000}}' 2>&1", esc_id);
-    run_cmd(cmd, out, outlen);
-    if (!out[0]) {
-        snprintf(out, outlen, "IR capture returned no payload. The HAL capture path is present, but it only replies when a frame is received during the transaction.");
+    if (count < 2) return -1;
+    /* Keep one frame when the remote repeated it while the key was held. */
+    for (i = 0; i + 1 < count; i++) if (spaces[i] >= IR_CAPTURE_FRAME_GAP_US) { frame = i + 1; break; }
+    if (frame && frame * 2 <= count) {
+        int repeated = 1;
+        for (i = 0; i < frame && repeated; i++)
+            repeated = timing_close(marks[i], marks[frame + i]) &&
+                       (i + 1 == frame || timing_close(spaces[i], spaces[frame + i]));
+        if (repeated) count = frame;
+    }
+    pos = (size_t)snprintf(out, outlen, "F%lX", freq);
+    for (i = 0; i < count && pos < outlen; i++)
+        pos += (size_t)snprintf(out + pos, outlen - pos, "P%XS%X", marks[i], spaces[i]);
+    #undef CAPTURE_WORD
+    return pos < outlen ? 0 : -1;
+}
+
+/* Parses codex_hal_ltcp --hex output: JSON reply, NUL, capture binary. */
+static int hal_capture_reply_to_raw(const char *hex, char *out, size_t outlen) {
+    static unsigned char reply[8192];
+    size_t len = 0, json_len;
+    while (hex[0] && hex[1] && isxdigit((unsigned char)hex[0]) && isxdigit((unsigned char)hex[1]) && len < sizeof(reply)) {
+        char byte[3] = {hex[0], hex[1], 0};
+        reply[len++] = (unsigned char)strtoul(byte, NULL, 16);
+        hex += 2;
+    }
+    if (*hex && *hex != '\n' && *hex != '\r') return -1;
+    json_len = strnlen((const char *)reply, len);
+    if (json_len == len || !strstr((const char *)reply, "\"code\":200")) return -1;
+    return ir_capture_to_raw(reply + json_len + 1, len - json_len - 1, out, outlen);
+}
+
+static void capture_ir_command_action(char *out, size_t outlen) {
+    static char reply[17000];
+    /* Ask the HAL directly: the stock HBus bridge drops the captured timings. */
+    run_cmd("/data/codex/bin/codex_hal_ltcp ir.cap '{\"timeout\":15000}' 20 --wait=20 --hex 2>&1", reply, sizeof(reply));
+    if (hal_capture_reply_to_raw(reply, out, outlen) == 0) return;
+    if (!reply[0] || isxdigit((unsigned char)reply[0])) {
+        snprintf(out, outlen, "No IR signal received. Point the remote at the hub and press the button within 15 seconds.");
+    } else {
+        copy_text(out, outlen, reply);
     }
 }
 
