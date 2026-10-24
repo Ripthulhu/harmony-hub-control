@@ -930,7 +930,8 @@
     pulse(seq, 0, u * 48);
     return seqRaw(38000, seq);
   }
-  function rcaRaw(proto, d, f) {
+  // IRDB/IRP numbers are MSB-first; Flipper files store RCA fields LSB-first (lsb = true).
+  function rcaRaw(proto, d, f, lsb) {
     d = Number(d);
     f = Number(f);
     if (
@@ -945,12 +946,13 @@
     const old = /old/i.test(proto || ""),
       freq = /38/.test(proto || "") ? 38700 : 58000,
       seq = [],
-      u = 460;
+      u = 460,
+      bits = lsb ? lsbBits : msbBits;
     if (old) pulse(seq, 1, u * 32);
     pulse(seq, 1, u * 8);
     pulse(seq, 0, u * 8);
-    msbBits(d, 4)
-      .concat(msbBits(f, 8), msbBits(~d & 15, 4), msbBits(~f & 255, 8))
+    bits(d, 4)
+      .concat(bits(f, 8), bits(~d & 15, 4), bits(~f & 255, 8))
       .forEach((b) => {
         pulse(seq, 1, u);
         pulse(seq, 0, b ? u * 4 : u * 2);
@@ -1563,7 +1565,7 @@
         else if (/^Pioneer/i.test(p))
           key = keyFromParts(p, a[0], a[0] ^ 255, c[0]);
         else if (/^RCA/i.test(p)) {
-          raw = rcaRaw(p, a[0], c[0]);
+          raw = rcaRaw(p, a[0], c[0], true);
           meta = raw ? p + " converted timing" : p + " unsupported";
         } else if (/^RC5/i.test(p)) {
           raw = rc5Raw(cur);
