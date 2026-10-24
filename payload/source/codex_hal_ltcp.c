@@ -16,6 +16,11 @@
 
 #include "ltcp_send.h"
 
+/* --wait extends the first-reply timeout (IR capture waits for a key press);
+   --hex prints the whole reply, including binary data after the JSON. */
+static int wait_seconds = 8;
+static int hex_output = 0;
+
 static int connect_hal(void) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr;
@@ -26,7 +31,7 @@ static int connect_hal(void) {
         return -1;
     }
 
-    tv.tv_sec = 8;
+    tv.tv_sec = wait_seconds;
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -307,6 +312,11 @@ static int run_ltcp_once(const char *cmd, const char *data, int timeout, const c
             break;
         }
         total += (size_t)n;
+        if (wait_seconds > 8) {
+            /* The reply has started; only wait briefly for its remaining frames. */
+            struct timeval tv = {1, 0};
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        }
     }
     close(fd);
 
@@ -321,6 +331,10 @@ static int run_ltcp_once(const char *cmd, const char *data, int timeout, const c
         size_t copy = payload_len < response_len - 1 ? payload_len : response_len - 1;
         memcpy(response, payload, copy);
         response[copy] = 0;
+    } else if (hex_output) {
+        size_t i;
+        for (i = 0; i < payload_len; i++) printf("%02x", payload[i]);
+        putchar('\n');
     } else {
         fwrite(payload, 1, payload_len, stdout);
         putchar('\n');
@@ -385,6 +399,14 @@ int main(int argc, char **argv) {
         } else if (strncmp(argv[i], "--seq-file=", 11) == 0) {
             seq_file = argv[i] + 11;
             first_payload = i + 1;
+        } else if (strncmp(argv[i], "--wait=", 7) == 0) {
+            wait_seconds = atoi(argv[i] + 7);
+            if (wait_seconds < 1) wait_seconds = 1;
+            if (wait_seconds > 60) wait_seconds = 60;
+            first_payload = i + 1;
+        } else if (strcmp(argv[i], "--hex") == 0) {
+            hex_output = 1;
+            first_payload = i + 1;
         } else {
             break;
         }
@@ -413,6 +435,7 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (hex_output) return run_ltcp_once(cmd, data, timeout, NULL, NULL, 0);
     rc = run_ltcp_once(cmd, data, timeout, NULL, last, sizeof(last));
     if (rc != 0) return rc;
     printf("%s\n", last[0] ? last : "no response");

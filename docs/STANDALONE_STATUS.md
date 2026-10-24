@@ -2,6 +2,29 @@
 
 This file records acceptance evidence, not a release claim.
 
+## IR Learning Through The HAL (2026-10-24)
+
+Learn a command never returned a signal: the stock HBus bridge answers `ir.cap`
+with only `{"code":200}` and drops the captured bytes. Capture now asks the HAL
+directly through `codex_hal_ltcp --wait=20 --hex` and converts its binary reply
+to raw `F..P..S..` timing. A repeated frame from a held key is kept once.
+
+Reply layout, confirmed against a native profile: one status byte, then
+big-endian 16-bit words: first mark, carrier in 250 Hz units, first period, then
+(mark, period) pairs in microseconds; a word with bit 15 set ends the capture.
+Captured Volume Up decoded to the same RCA frame as the hub's stock `VolumeUp`
+command.
+
+On a Harmony Hub / 4.15.600, a TCL Google TV remote key (Bluetooth disabled on
+the TV so the remote sends IR) was learned in the UI, saved as raw timing and
+replayed by the hub; the TV responded. `test_ir_runtime.c` covers the decoder with real captures,
+including noise rejection. `test_local_api.py` passed. The rebuilt
+MIPS binaries came from the Bootlin `mips32--uclibc--stable-2017.05` toolchain,
+which reproduces the previous shipped binaries byte for byte.
+
+Do not start overlapping `ir.cap` requests: the I2S receiver can stay busy until
+the hub restarts. Only one remote and one protocol (RCA) were tested.
+
 ## MQTT And Home Assistant Rewrite (2026-10-05)
 
 Deployed to the verified Harmony Hub / 4.15.600 and the existing Home Assistant

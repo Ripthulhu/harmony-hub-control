@@ -1,8 +1,8 @@
 a20c26c86514c671a4720c0069f80b7e  codex_bthid_keyboard
 2f0a6fc6303743eeccc77d1b93e7253f  codex_dhcpd
-4c40847878f3bb3d9ee9213c177e0a29  codex_hal_ltcp
+f606e67325672fe8cec0f869b6491ccf  codex_hal_ltcp
 66885f24237df3f29293820cfdd15cab  codex_hbus
 d16934c94f0cf1bc12f947e61accb931  codex_portal
-aaece7bdc35a4463830ca1799894fc20  codex_webui
+7a8ecc273c9c6377e7db2e39de249447  codex_webui
 3733327fd04bca282dbf06f33da0bf6c  dropbearmulti
 034252e3dc78cb548d6b99d6dcbad836  FILES
