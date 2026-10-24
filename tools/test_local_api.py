@@ -311,10 +311,31 @@ def run():
             configuration["layouts"][device_id] = [{"slot": "volumeup", "label": "Volume", "command": "VolumeUp"}]
             configuration["activities"] = [{"id": "watch", "name": "Watch TV", "steps": [], "exitSteps": [], "buttons": [{"slot": "volumeup", "deviceId": device_id, "command": "VolumeUp", "label": "Volume"}]}]
             assert request("configuration", {"revision": 6, "configuration": configuration}, cookie, csrf)[0] == 200
-            assert request("commands/save", {"revision": 7, "deviceId": device_id, "oldName": "PowerOff", "name": "Off", "mode": "nec", "protocol": "2", "nec": "20DFA35C"}, cookie, csrf)[0] == 200
-            assert request("devices", {"revision": 8, "deviceId": device_id, "action": "delete"}, cookie, csrf)[0] == 200
+            # Deleting a command: activity users and stock function-map commands are refused;
+            # the device's own remote buttons for it are removed with it.
+            def command_names():
+                return [c["name"] for c in request("devices", cookie=cookie)[1]["devices"][0]["commands"]]
+            status, refused, _ = request("commands/save", {"revision": 7, "deviceId": device_id, "action": "delete", "name": "VolumeUp"}, cookie, csrf)
+            assert status == 400 and "Watch TV" in refused["error"], refused
+            assert command_names() == ["PowerOff", "VolumeUp"]
+            function_list = resources / "FunctionList.json"
+            function_list.write_text(json.dumps({"FunctionMaps": [{"DeviceId-": int(device_id), "FunctionGroups": [
+                {"Name": "Power", "Functions": [{"Name": "PowerOff", "CommandName": "PowerOff"}]}]}]}))
+            status, refused, _ = request("commands/save", {"revision": 7, "deviceId": device_id, "action": "delete", "name": "PowerOff"}, cookie, csrf)
+            assert status == 400 and "stock" in refused["error"], refused
+            assert command_names() == ["PowerOff", "VolumeUp"]
+            function_list.write_text(json.dumps(fixtures["FunctionList"]))
+            assert request("commands/import", {"revision": 7, "deviceId": device_id, "payload": "Spare|raw|F9470P100S100P100S100"}, cookie, csrf)[0] == 200
+            configuration = request("configuration", cookie=cookie)[1]
+            configuration["layouts"][device_id].append({"slot": "mute", "label": "Spare", "command": "Spare"})
+            assert request("configuration", {"revision": 8, "configuration": configuration}, cookie, csrf)[0] == 200
+            assert request("commands/save", {"revision": 9, "deviceId": device_id, "action": "delete", "name": "Spare"}, cookie, csrf)[0] == 200
+            assert command_names() == ["PowerOff", "VolumeUp"]
+            assert request("configuration", cookie=cookie)[1]["layouts"][device_id] == [{"slot": "volumeup", "label": "Volume", "command": "VolumeUp"}]
+            assert request("commands/save", {"revision": 10, "deviceId": device_id, "oldName": "PowerOff", "name": "Off", "mode": "nec", "protocol": "2", "nec": "20DFA35C"}, cookie, csrf)[0] == 200
+            assert request("devices", {"revision": 11, "deviceId": device_id, "action": "delete"}, cookie, csrf)[0] == 200
             assert request("devices", cookie=cookie)[1]["devices"] == []
-            assert request("backups/restore", {"revision": 9, "backup": backup}, cookie, csrf)[0] == 200
+            assert request("backups/restore", {"revision": 12, "backup": backup}, cookie, csrf)[0] == 200
             command = {"deviceId": "123", "command": "VolumeUp", "mode": "hold", "transport": "ir"}
             status, op, _ = request("commands/send", command, second, pending["csrf"])
             assert status == 202
