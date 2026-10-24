@@ -32,6 +32,18 @@ for (const [source, path, text] of fixtures) {
 const compact = parse(fixtures[0][2], 'irdb', 'tv.csv');
 assert.equal(compact[0].keycode, 'G:Toshiba 32 Bit:(0x20DF10EF)(Repeat)():3');
 assert.equal(parse(fixtures[0][2]+'\nPower again,NEC,4,-1,8', 'irdb', 'tv.csv').length, 1);
+// RCA frame bits as sent, read from raw timing: header pair, then 24 bits (long space = 1).
+const rcaWireBits = raw => {
+  const spaces = [...raw.matchAll(/S([0-9A-F]+)/g)].map(m => parseInt(m[1], 16));
+  return spaces.slice(1, 25).map(s => s > 1380 ? 1 : 0).reduce((v, b) => v * 2 + b, 0).toString(16).toUpperCase();
+};
+// Flipper stores RCA address/command LSB-first: TCL Vol_up (0F/F4) is sent as F 2F 0 D0,
+// matching the hub's stock TCL VolumeUp code.
+const flipperRca = parse('Filetype: IR signals file\nVersion: 1\n#\nname: Vol_up\ntype: parsed\nprotocol: RCA\naddress: 0F 00 00 00\ncommand: F4 00 00 00', 'flipper', 'tcl.ir');
+assert.equal(rcaWireBits(flipperRca[0].raw), 'F2F0D0');
+// IRDB CSV uses the IRP definition, MSB-first: device 15, function 244 is sent as F F4 0 0B.
+const irdbRca = parse('functionname,protocol,device,subdevice,function\nVol_up,RCA,15,-1,244', 'irdb', 'tcl.csv');
+assert.equal(rcaWireBits(irdbRca[0].raw), 'FF400B');
 assert.equal(parse('{broken', 'smartir', 'tv.json').length, 0);
 assert.equal(parse('', 'custom', '').length, 0);
-console.log('Standalone profile parsers: '+fixtures.length+' offline formats, NEC encoding, duplicate removal and malformed input passed');
+console.log('Standalone profile parsers: '+fixtures.length+' offline formats, NEC encoding, RCA bit order, duplicate removal and malformed input passed');
