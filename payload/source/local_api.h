@@ -633,6 +633,54 @@ static int local_validate_config(const cJSON *o) {
     }
     return 1;
 }
+static int step_uses_command(const cJSON *steps, const char *device_id, const char *name) {
+    const cJSON *step;
+    cJSON_ArrayForEach(step, steps)
+        if (!strcmp(lj_str(step, "deviceId"), device_id) && !strcmp(lj_str(step, "command"), name)) return 1;
+    return 0;
+}
+
+/* Native activities reach stock commands through FunctionList; local activities
+   name them directly. Deleting either kind of reference target is refused. */
+static int ir_command_delete_refused(cJSON *config, const char *device_id, const char *name, char *msg, size_t msglen) {
+    cJSON *maps = resource_read(FUNCTION_LIST, "FunctionMaps"), *map, *group, *function, *activity;
+    long id = strtol(device_id, NULL, 10);
+    size_t used = 0;
+    cJSON_ArrayForEach(map, lj_get(maps, "FunctionMaps")) {
+        if (lj_int(map, "DeviceId-", lj_int(map, "DeviceId", -1)) != id) continue;
+        cJSON_ArrayForEach(group, lj_get(map, "FunctionGroups")) cJSON_ArrayForEach(function, lj_get(group, "Functions"))
+            if (!strcmp(lj_str(function, "CommandName"), name)) {
+                cJSON_Delete(maps);
+                snprintf(msg, msglen, "%s is a stock command used by native activities and cannot be deleted.", name);
+                return 1;
+            }
+    }
+    cJSON_Delete(maps);
+    cJSON_ArrayForEach(activity, lj_get(config, "activities")) {
+        if (!step_uses_command(lj_get(activity, "steps"), device_id, name) &&
+            !step_uses_command(lj_get(activity, "exitSteps"), device_id, name) &&
+            !step_uses_command(lj_get(activity, "buttons"), device_id, name)) continue;
+        used += (size_t)snprintf(msg + used, used < msglen ? msglen - used : 0, "%s%s",
+                                 used ? ", " : "", lj_str(activity, "name"));
+        if (used >= msglen) break;
+    }
+    if (used) {
+        char activities[512];
+        copy_text(activities, sizeof(activities), msg);
+        snprintf(msg, msglen, "%s is used by activity %s. Remove it there first.", name, activities);
+    }
+    return used > 0;
+}
+
+static void remove_layout_command(cJSON *config, const char *device_id, const char *name) {
+    cJSON *layout = lj_get(lj_get(config, "layouts"), device_id), *button = layout ? layout->child : NULL;
+    while (button) {
+        cJSON *next = button->next;
+        if (!strcmp(lj_str(button, "command"), name)) cJSON_Delete(cJSON_DetachItemViaPointer(layout, button));
+        button = next;
+    }
+}
+
 static void local_configuration_change(int fd, const struct request *r, cJSON *body) {
     int lock = local_lock(), ir_lock = -1, rc = -1; cJSON *config = NULL, *out = cJSON_CreateObject(); char msg[1024] = "", created[64] = "";
     const char *path = r->path;
@@ -695,7 +743,11 @@ static void local_configuration_change(int fd, const struct request *r, cJSON *b
     } else if (strcmp(path, "/api/v1/commands/save") == 0) {
         if (!strcmp(lj_str(body, "transport"), "bluetooth"))
             rc = upsert_bt_command(lj_str(body, "deviceId"), lj_str(body, "oldName"), lj_str(body, "name"), lj_str(body, "script"), lj_int(body, "delayMs", 35), msg, sizeof(msg));
-        else if (!strcmp(lj_str(body, "action"), "delete")) rc = delete_ir_command(lj_str(body, "deviceId"), lj_str(body, "name"), msg, sizeof(msg));
+        else if (!strcmp(lj_str(body, "action"), "delete")) {
+            if (!ir_command_delete_refused(config, lj_str(body, "deviceId"), lj_str(body, "name"), msg, sizeof(msg)) &&
+                !(rc = delete_ir_command(lj_str(body, "deviceId"), lj_str(body, "name"), msg, sizeof(msg))))
+                remove_layout_command(config, lj_str(body, "deviceId"), lj_str(body, "name"));
+        }
         else if (lj_str(body, "oldName")[0]) rc = update_ir_command(lj_str(body, "deviceId"), lj_str(body, "oldName"), lj_str(body, "name"), lj_str(body, "mode"), lj_str(body, "protocol"), lj_str(body, "nec"), lj_str(body, "keycode"), lj_str(body, "raw"), msg, sizeof(msg));
         else rc = add_ir_command(lj_str(body, "deviceId"), lj_str(body, "name"), lj_str(body, "mode"), lj_str(body, "protocol"), lj_str(body, "nec"), lj_str(body, "keycode"), lj_str(body, "raw"), msg, sizeof(msg));
     } else if (strcmp(path, "/api/v1/commands/import") == 0) {
