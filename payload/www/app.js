@@ -471,7 +471,7 @@ document.addEventListener('click',async event=>{
     else if(action==='test-device')renderDeviceTest(state.editor);
     else if(action==='device-back')renderDeviceEditor(state.editor);
     else if(action==='learn')renderLearn();
-    else if(action==='delete-command'){const name=button.dataset.deleteCommand,id=state.editor.id;if(confirm(`Delete ${name} from this device? Remote buttons that send it are removed too.`)){await mutate('commands/save',{action:'delete',deviceId:id,name});await loadDevices();state.editor=state.devices.find(d=>d.id===id);renderDeviceEditor(state.editor);notice(`${name} deleted.`);}}
+    else if(action==='delete-command'){const name=button.dataset.deleteCommand,id=state.editor.id;if(confirm(`Delete ${name} from this device? Remote buttons that send it are removed too.`)){try{await mutate('commands/save',{action:'delete',deviceId:id,name});await loadDevices();state.editor=state.devices.find(d=>d.id===id);renderDeviceEditor(state.editor);notice(`${name} deleted.`);}catch(error){notice(error.message,true);}$('notice').scrollIntoView({block:'nearest'});}}
     else if(action==='delete-device'){if(confirm('Delete this device from the hub?')){await mutate('devices',{action:'delete',deviceId:state.editor.id,transport:state.editor.transport});await loadDevices();show('devices');}}
     else if(action==='capture'){const result=await api('commands/learn',{});$('learn-raw').value=result.raw||'';$('learn-mode').value=result.mode||'raw';$('learn-protocol').value=result.protocolId||'2';$('learn-code').value=result.keycode||result.nec||'';$('capture-result').textContent=result.analysis||'Capture received. Verify the signal before saving.';updateLearnSave();}
     else if(action==='bt-command')renderBluetoothCommand();
